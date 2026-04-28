@@ -1,0 +1,14 @@
+{
+  "ticker": "{{ticker}}",
+  "symbol": "{{ticker}}",
+  "exchange": "{{exchange}}",
+  "interval": "{{interval}}",
+  "price": "{{close}}",
+  "time": "{{time}}",
+  "action": "{{strategy.order.action}}",
+  "signal": "{{strategy.order.action}}",
+  "strategy_position": "{{strategy.position_size}}",
+  "strategy_order_action": "{{strategy.order.action}}",
+  "strategy_order_contracts": "{{strategy.order.contracts}}",
+  "notes": "Add any indicator values or setup context you want ChatGPT to analyze."
+}
