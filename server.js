@@ -4902,7 +4902,16 @@ function renderTradingPlatform() {
 </head>
 <body>
   <div id="app" class="app-shell">
-    <aside class="sidebar">
+    <header class="mobile-header">
+      <button id="mobile-menu-toggle" class="mobile-icon-btn" type="button" aria-expanded="false" aria-controls="mobile-sidebar">Menu</button>
+      <div class="mobile-header-center">
+        <strong>Trading Home</strong>
+        <span id="mobile-health" class="mobile-health-pill">Checking</span>
+      </div>
+      <button id="mobile-refresh-now" class="mobile-icon-btn" type="button">Refresh</button>
+    </header>
+    <div id="mobile-nav-backdrop" class="mobile-nav-backdrop hidden" aria-hidden="true"></div>
+    <aside class="sidebar" id="mobile-sidebar">
       <div>
         <p class="eyebrow">Local Trading Engine</p>
         <h1>Trading Home</h1>
@@ -4914,17 +4923,17 @@ function renderTradingPlatform() {
         <button data-view="watchlist">Watchlist</button>
         <button data-view="browser">Market Browser</button>
         <button data-view="execution">Execution</button>
-        <button data-view="intraday">Intraday</button>
-        <button data-view="swing">Swing</button>
-        <button data-view="futures">Futures</button>
-        <button data-view="bitcoin">Bitcoin</button>
-        <button data-view="crypto">Crypto</button>
         <button data-view="alerts">Alerts</button>
-        <button data-view="lifecycle">Lifecycle</button>
         <button data-view="journal">Journal</button>
-        <button data-view="news">News</button>
-        <button data-view="ai">Signal Brain</button>
         <button data-view="settings">Settings</button>
+        <button data-view="intraday" class="desktop-nav-only">Intraday</button>
+        <button data-view="swing" class="desktop-nav-only">Swing</button>
+        <button data-view="futures" class="desktop-nav-only">Futures</button>
+        <button data-view="bitcoin" class="desktop-nav-only">Bitcoin</button>
+        <button data-view="crypto" class="desktop-nav-only">Crypto</button>
+        <button data-view="lifecycle" class="desktop-nav-only">Lifecycle</button>
+        <button data-view="news" class="desktop-nav-only">News</button>
+        <button data-view="ai" class="desktop-nav-only">Signal Brain</button>
       </nav>
       <div class="side-note">
         <strong>Beginner rule</strong>

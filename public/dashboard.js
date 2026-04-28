@@ -30,7 +30,9 @@ const state = {
     pendingChartMode: "",
     bootRefreshTimer: null,
     bootRefreshAttempts: 0,
-    emptyAutoScanAt: {}
+    emptyAutoScanAt: {},
+    isMobile: window.matchMedia("(max-width: 767px)").matches,
+    mobileNavOpen: false
   },
   timer: null
 };
@@ -129,6 +131,7 @@ const content = document.querySelector("#content");
 const message = document.querySelector("#message");
 const lastUpdated = document.querySelector("#last-updated");
 const systemHealth = document.querySelector("#system-health");
+const mobileHealth = document.querySelector("#mobile-health");
 const viewTitle = document.querySelector("#view-title");
 const viewEyebrow = document.querySelector("#view-eyebrow");
 const chartModal = document.querySelector("#chart-modal");
@@ -136,6 +139,10 @@ const chartFrame = document.querySelector("#chart-frame");
 const chartTitle = document.querySelector("#chart-title");
 const chartClose = document.querySelector("#chart-close");
 const chartToolbar = document.querySelector("#chart-toolbar");
+const mobileMenuToggle = document.querySelector("#mobile-menu-toggle");
+const mobileRefreshButton = document.querySelector("#mobile-refresh-now");
+const mobileNavBackdrop = document.querySelector("#mobile-nav-backdrop");
+const mobileMedia = window.matchMedia("(max-width: 767px)");
 
 document.querySelectorAll("[data-view]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -144,7 +151,10 @@ document.querySelectorAll("[data-view]").forEach((button) => {
 });
 
 document.querySelector("#refresh-now").addEventListener("click", loadView);
+mobileRefreshButton?.addEventListener("click", loadView);
 document.querySelector("#global-search")?.addEventListener("submit", handleGlobalSearch);
+mobileMenuToggle?.addEventListener("click", toggleMobileNav);
+mobileNavBackdrop?.addEventListener("click", closeMobileNav);
 chartClose?.addEventListener("click", closeChart);
 chartToolbar?.addEventListener("click", (event) => {
   const button = event.target.closest("[data-chart-interval]");
@@ -172,6 +182,8 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", () => { void stopDashboardSession({ preferBeacon: true }); });
 window.addEventListener("beforeunload", () => { void stopDashboardSession({ preferBeacon: true }); });
+mobileMedia.addEventListener("change", syncViewportLayout);
+syncViewportLayout();
 resetInactivityTimer();
 void initializeDashboard();
 state.timer = setInterval(loadView, 45000);
@@ -182,6 +194,30 @@ async function initializeDashboard() {
   }
   await loadView();
   scheduleBootRefresh();
+}
+
+function syncViewportLayout() {
+  state.ui.isMobile = mobileMedia.matches;
+  document.body.classList.toggle("mobile-layout", state.ui.isMobile);
+  if (!state.ui.isMobile) closeMobileNav();
+}
+
+function toggleMobileNav() {
+  state.ui.mobileNavOpen ? closeMobileNav() : openMobileNav();
+}
+
+function openMobileNav() {
+  state.ui.mobileNavOpen = true;
+  document.body.classList.add("mobile-nav-open");
+  mobileMenuToggle?.setAttribute("aria-expanded", "true");
+  mobileNavBackdrop?.classList.remove("hidden");
+}
+
+function closeMobileNav() {
+  state.ui.mobileNavOpen = false;
+  document.body.classList.remove("mobile-nav-open");
+  mobileMenuToggle?.setAttribute("aria-expanded", "false");
+  mobileNavBackdrop?.classList.add("hidden");
 }
 
 async function loadView() {
@@ -547,28 +583,52 @@ async function renderDashboardHome() {
         ${quickSearch("NVDA")} ${quickSearch("KRE")} ${quickSearch("UNG")} ${quickSearch("XLF")} ${quickSearch("BTC")} ${quickSearch("SPX")}
       </div>
     </section>
-    <section class="grid cols-2 dashboard-zones">
-      ${panel("What Can I Trade Right Now?", workflow.readyNow.length
-        ? renderTradeSection(workflow.readyNow.slice(0, 5), { source: "plan", sectionKind: "ready" })
-        : `${renderTradeNowEmptyState(workflow.watchlist, signalRows)}${workflow.watchlist.length ? `<div class="section-subgrid">${workflow.watchlist.slice(0, 3).map((signal) => renderActionCard(signal, "watch")).join("")}</div>` : ""}`)}
-      ${panel("What Is Moving Up Right Now?", `
-        <div class="section-note">Movers are not automatic buys. Use them to find charts worth checking.</div>
-        ${renderActionCardGrid(workflow.movingNow.slice(0, 6), "movers")}
-      `)}
-    </section>
-    <section class="grid cols-2 dashboard-zones">
-      ${panel("Good Ideas, But Not Buys Yet", renderActionCardGrid(workflow.watchlist.slice(0, 6), "watch"))}
-      ${panel("ChatGPT Decision Desk", `
-        <div class="brain-summary">
-          <div class="brain-chip ${ai.connected ? "good" : "bad"}">AI Brain ${ai.connected ? "Online" : "Offline"}</div>
-          <div class="brain-chip ${regime.regime === "bullish" ? "good" : regime.regime === "bearish" ? "bad" : "neutral"}">Regime ${escapeHtml(regime.regime || "unknown")}</div>
-          <div class="brain-chip neutral">${session.active_dashboard_sessions || 0} live session${session.active_dashboard_sessions === 1 ? "" : "s"}</div>
-        </div>
-        ${renderTradingAssistantChat("What can I trade right now, what is moving, and what should I avoid?")}
-      `)}
-    </section>
-    ${panel("Ignore For Now", renderActionCardGrid(workflow.avoid.slice(0, 8), "skip", true))}
-    ${renderAdvancedDetails("Advanced Details", renderSignalTable(signalRows.slice(0, 12), { compact: true }))}
+    ${state.ui.isMobile
+      ? `
+        ${panel("System Status", renderMobileStatusStack({ overview, alerts, executionCount: rankedPlans.length }))}
+        ${panel("Buy Now", workflow.readyNow.length
+          ? renderTradeSection(workflow.readyNow.slice(0, 3), { source: "plan", sectionKind: "ready" })
+          : renderTradeNowEmptyState(workflow.watchlist, signalRows))}
+        ${panel("Movers", `
+          <div class="section-note">Movers are not automatic buys.</div>
+          ${renderActionCardGrid(workflow.movingNow.slice(0, 4), "movers")}
+        `)}
+        ${panel("Watchlist", renderActionCardGrid(workflow.watchlist.slice(0, 4), "watch"))}
+        ${renderAdvancedDetails("More Tools", `
+          <div class="mobile-quick-actions">
+            <button class="action-btn" type="button" data-view-jump="browser">Open Market Browser</button>
+            <button class="action-btn" type="button" data-view-jump="execution">Open Execution</button>
+            <button class="action-btn" type="button" data-view-jump="alerts">Open Alerts</button>
+            <button class="action-btn" type="button" data-view-jump="journal">Open Journal</button>
+          </div>
+          ${panel("Ignore For Now", renderActionCardGrid(workflow.avoid.slice(0, 6), "skip", true))}
+          ${panel("ChatGPT Decision Desk", renderTradingAssistantChat("What can I trade right now on mobile?"))}
+        `)}
+      `
+      : `
+        <section class="grid cols-2 dashboard-zones">
+          ${panel("What Can I Trade Right Now?", workflow.readyNow.length
+            ? renderTradeSection(workflow.readyNow.slice(0, 5), { source: "plan", sectionKind: "ready" })
+            : `${renderTradeNowEmptyState(workflow.watchlist, signalRows)}${workflow.watchlist.length ? `<div class="section-subgrid">${workflow.watchlist.slice(0, 3).map((signal) => renderActionCard(signal, "watch")).join("")}</div>` : ""}`)}
+          ${panel("What Is Moving Up Right Now?", `
+            <div class="section-note">Movers are not automatic buys. Use them to find charts worth checking.</div>
+            ${renderActionCardGrid(workflow.movingNow.slice(0, 6), "movers")}
+          `)}
+        </section>
+        <section class="grid cols-2 dashboard-zones">
+          ${panel("Good Ideas, But Not Buys Yet", renderActionCardGrid(workflow.watchlist.slice(0, 6), "watch"))}
+          ${panel("ChatGPT Decision Desk", `
+            <div class="brain-summary">
+              <div class="brain-chip ${ai.connected ? "good" : "bad"}">AI Brain ${ai.connected ? "Online" : "Offline"}</div>
+              <div class="brain-chip ${regime.regime === "bullish" ? "good" : regime.regime === "bearish" ? "bad" : "neutral"}">Regime ${escapeHtml(regime.regime || "unknown")}</div>
+              <div class="brain-chip neutral">${session.active_dashboard_sessions || 0} live session${session.active_dashboard_sessions === 1 ? "" : "s"}</div>
+            </div>
+            ${renderTradingAssistantChat("What can I trade right now, what is moving, and what should I avoid?")}
+          `)}
+        </section>
+        ${panel("Ignore For Now", renderActionCardGrid(workflow.avoid.slice(0, 8), "skip", true))}
+        ${renderAdvancedDetails("Advanced Details", renderSignalTable(signalRows.slice(0, 12), { compact: true }))}
+      `}
   `;
   document.querySelector("#power-toggle")?.addEventListener("click", () => setPower(!state.powerOn));
   document.querySelector("#run-fresh-scan")?.addEventListener("click", (event) => {
@@ -887,13 +947,7 @@ async function renderSignals(mode) {
         ? renderActionCardGrid((data.signals || []).slice(0, 12), mode === "bitcoin" ? "movers" : "watch")
         : sectionEmptyState}
     </section>
-    <section class="panel">
-      <div class="panel-header">
-        <h3>Detailed View</h3>
-        <span class="small">Optional</span>
-      </div>
-      ${(data.signals || []).length ? renderSignalTable(data.signals || []) : sectionEmptyState}
-    </section>
+    ${renderAdvancedDetails("Advanced Details", (data.signals || []).length ? renderSignalTable(data.signals || []) : sectionEmptyState)}
   `;
   maybeAutoRunEmptySectionScan(mode, data.signals || []);
   bindSignalToolbar();
@@ -1213,6 +1267,23 @@ function renderCommandStatusBar({ overview = {}, alerts = {}, executionCount = 0
         <span></span>${state.powerOn ? "Power Off" : "Power On"}
       </button>
     </section>
+  `;
+}
+
+function renderMobileStatusStack({ overview = {}, alerts = {}, executionCount = 0 } = {}) {
+  const regime = overview.market_regime || {};
+  const auto = overview.auto_scan || {};
+  const ai = overview.ai_brain || {};
+  return `
+    <div class="mobile-status-stack">
+      ${statusPill("System", state.powerOn ? "Online" : "Offline", state.powerOn ? "good" : "bad")}
+      ${statusPill("Auto-scan", auto.auto_scan_enabled ? "On" : "Off", auto.auto_scan_enabled ? "good" : "neutral")}
+      ${statusPill("AI Brain", ai.connected ? "Online" : "Offline", ai.connected ? "good" : "bad")}
+      ${statusPill("Regime", regime.regime || "unknown", regime.regime === "bullish" ? "good" : regime.regime === "bearish" ? "bad" : "neutral")}
+      ${statusPill("Ready", executionCount || 0, executionCount ? "good" : "neutral")}
+      ${statusPill("Alerts", (alerts.actionable_alerts || []).length || 0, (alerts.actionable_alerts || []).length ? "good" : "neutral")}
+      <button class="action-btn primary-action" type="button" data-empty-action="scan" data-empty-mode="all">Run fresh scan</button>
+    </div>
   `;
 }
 
@@ -2684,6 +2755,7 @@ function setActiveView(view) {
 
 async function navigateToView(view) {
   closeChart();
+  closeMobileNav();
   setActiveView(view);
   await loadView();
 }
@@ -2704,6 +2776,10 @@ function updateSystemHealthBadge(status = {}) {
   const detail = status.detail ? ` · ${status.detail}` : "";
   systemHealth.textContent = `${label}${detail}`;
   systemHealth.className = `health-badge ${tone}`;
+  if (mobileHealth) {
+    mobileHealth.textContent = label;
+    mobileHealth.className = `mobile-health-pill ${tone}`;
+  }
 }
 
 function renderInlineChart(ticker) {
