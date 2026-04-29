@@ -292,6 +292,14 @@ const MOMENTUM_MIN_CONFIDENCE = 5;
 const MOMENTUM_MAX_ENTRY_DISTANCE_PCT = 2.25;
 const MOMENTUM_MAX_STOP_PCT = 2;
 const MOMENTUM_POSITION_SCALE = 0.7;
+const INTERTRADE_MIN_SCORE = 80;
+const INTERTRADE_MIN_CONTINUATION_SCORE = 75;
+const INTERTRADE_MIN_VOLUME_SCORE = 70;
+const INTERTRADE_MIN_RISK_REWARD_SCORE = 70;
+const INTERTRADE_MIN_CONFIDENCE = 6;
+const INTERTRADE_MAX_ENTRY_DISTANCE_PCT = 0.9;
+const INTERTRADE_MAX_STOP_PCT = 2;
+const INTERTRADE_MAX_RESULTS = 5;
 
 const state = {
   events: await loadEvents(),
@@ -1357,6 +1365,7 @@ async function analyzeScanWithOpenAI(rankedQuotes, request) {
       `Scanner mode: ${request.modeConfig.label}. Focus: ${request.modeConfig.promptFocus}.`,
       `Default hold window: ${request.modeConfig.holdWindow}. Asset class: ${request.modeConfig.assetClass}.`,
       "Also detect obvious bull runs or strong upward trends even if the setup is not perfect. Prefer clear, visible momentum over perfect but rare setups.",
+      "Prefer clean breakout-continuation names that are green, holding near highs, and still close enough to entry to trade without chasing.",
       "Return an array of objects with exactly these keys: ticker, bias, entry, stop, target1, target2, confidence, reason, invalid_if, buy_trigger, sell_trigger, bull_run_flag, hold_window, setup_score, momentum_score, trend_label, momentum_reason.",
       "The ticker value must exactly match the candidate symbol provided. For crypto, use the dashboard symbols like BTCUSD, ETHUSD, SOLUSD, XRPUSD, DOGEUSD, ADAUSD, AVAXUSD, LINKUSD, MATICUSD, LTCUSD, or SHIBUSD, not exchange pair names like BTCUSDT.",
       "confidence must be a number from 1 to 10.",
@@ -2091,6 +2100,12 @@ async function getChartSignal(tickerValue, mode = null, refresh = false) {
           sell_trigger: signal.sell_trigger,
           confidence: signal.confidence,
           momentum_score: signal.momentum_score,
+          breakout_score: signal.breakout_score,
+          continuation_score: signal.continuation_score,
+          volume_score: signal.volume_score,
+          entry_timing_score: signal.entry_timing_score,
+          risk_reward_score: signal.risk_reward_score,
+          intertrade_score: signal.intertrade_score,
           trend_label: signal.trend_label,
           momentum_reason: signal.momentum_reason,
           final_quality_score: signal.final_quality_score,
@@ -2115,13 +2130,17 @@ function getDashboardExecution(mode = null) {
     .filter((plan) => Boolean(plan.buy_now_type))
     .filter((plan) => plan.suggested_shares > 0)
     .sort((a, b) => buyNowSortScore(a, b));
+  const intertrade = plans
+    .filter((plan) => plan.buy_now_type === "intertrade_take")
+    .slice(0, INTERTRADE_MAX_RESULTS);
 
   return {
     ok: true,
     createdAt: new Date().toISOString(),
     settings: getExecutionSettings(),
     count: plans.length,
-    plans
+    plans,
+    intertrade_plans: intertrade
   };
 }
 
@@ -2321,6 +2340,16 @@ function evaluateSignalLifecycle(signal) {
     final_decision: signal.final_decision,
     confidence: signal.confidence,
     final_quality_score: signal.final_quality_score,
+    signal_type: signal.signal_type || "strict_take",
+    buy_now_type: getBuyNowType(signal),
+    breakout_score: signal.breakout_score ?? null,
+    continuation_score: signal.continuation_score ?? null,
+    volume_score: signal.volume_score ?? null,
+    entry_timing_score: signal.entry_timing_score ?? null,
+    risk_reward_score: signal.risk_reward_score ?? null,
+    intertrade_score: signal.intertrade_score ?? null,
+    target_reached: ["target1_hit", "target2_hit"].includes(status),
+    stop_hit: status === "stopped",
     regime: signal.market_regime,
     sector_strength: signal.sector_strength,
     expires_at: signal.expires_at,
@@ -2361,6 +2390,16 @@ function upsertJournalFromLifecycle(lifecycle) {
     confidence: lifecycle.confidence,
     final_quality_score: lifecycle.final_quality_score,
     final_decision: lifecycle.final_decision,
+    signal_type: lifecycle.signal_type,
+    buy_now_type: lifecycle.buy_now_type,
+    breakout_score: lifecycle.breakout_score,
+    continuation_score: lifecycle.continuation_score,
+    volume_score: lifecycle.volume_score,
+    entry_timing_score: lifecycle.entry_timing_score,
+    risk_reward_score: lifecycle.risk_reward_score,
+    intertrade_score: lifecycle.intertrade_score,
+    target_reached: lifecycle.target_reached,
+    stop_hit: lifecycle.stop_hit,
     regime: lifecycle.regime,
     sector_strength: lifecycle.sector_strength,
     webull_summary: lifecycle.webull_summary,
@@ -2539,6 +2578,16 @@ function normalizeJournalEntry(entry) {
     setup_score: numberOrNull(entry.setup_score),
     final_quality_score: numberOrNull(entry.final_quality_score),
     final_decision: String(entry.final_decision || "unknown"),
+    signal_type: String(entry.signal_type || "strict_take"),
+    buy_now_type: String(entry.buy_now_type || ""),
+    breakout_score: numberOrNull(entry.breakout_score),
+    continuation_score: numberOrNull(entry.continuation_score),
+    volume_score: numberOrNull(entry.volume_score),
+    entry_timing_score: numberOrNull(entry.entry_timing_score),
+    risk_reward_score: numberOrNull(entry.risk_reward_score),
+    intertrade_score: numberOrNull(entry.intertrade_score),
+    target_reached: Boolean(entry.target_reached),
+    stop_hit: Boolean(entry.stop_hit),
     regime: String(entry.regime || entry.market_regime || "unknown"),
     sector_strength: String(entry.sector_strength || "unknown"),
     webull_summary: String(entry.webull_summary || entry.ready_to_trade || ""),
@@ -2991,6 +3040,7 @@ function analyzeMomentumQuote(candidate = {}) {
   const high = Number(candidate.high || price);
   const low = Number(candidate.low || price);
   const previousClose = Number(candidate.previousClose || open);
+  const volume = Number(candidate.volume || 0);
   const dayRange = high - low;
   const rangePosition = dayRange > 0 ? (price - low) / dayRange : 0.5;
   const recentChange = getPctChange(price, previousClose || open);
@@ -3012,6 +3062,9 @@ function analyzeMomentumQuote(candidate = {}) {
   if (continuationCandle) score += 5;
   if (entryDistancePct <= MOMENTUM_MAX_ENTRY_DISTANCE_PCT) score += 8;
   score = Math.max(0, Math.min(100, Math.round(score)));
+  const vwap = average([open, high, low, price]);
+  const currentCandleStrength = dayRange > 0 ? (price - open) / dayRange : 0;
+  const dollarVolume = volume > 0 && Number.isFinite(price) ? volume * price : 0;
 
   return {
     ok: true,
@@ -3031,6 +3084,12 @@ function analyzeMomentumQuote(candidate = {}) {
     breaking_recent_high: breakingRecentHigh,
     continuation_candle: continuationCandle,
     bullish_stack: bullishStack,
+    vwap: roundNumber(vwap, 4),
+    price_above_vwap: Number.isFinite(vwap) ? price >= vwap : bullishStack,
+    current_candle_strength: roundNumber(currentCandleStrength, 3),
+    day_green: intradayChange > 0,
+    dollar_volume: roundNumber(dollarVolume, 2),
+    consolidation_then_push: breakingRecentHigh && rangePosition >= 0.84,
     momentum_score: score,
     trend_label: breakingRecentHigh ? "breakout" : continuationCandle ? "continuation" : bullishStack ? "strong uptrend" : "early trend",
     momentum_reason: `${candidate.symbol} is trading above the open and prior close, holding near the high of day, and showing visible upward pressure.`
@@ -3127,6 +3186,15 @@ function analyzeMomentumCandles(candles, symbol = "") {
   const breakingRecentHigh = price >= recentHigh;
   const continuationCandle = price > Number(latest.open || price) && price > Number(previous.close || price);
   const bullishStack = price > shortEma && shortEma > mediumEma;
+  const vwap = computeSessionVwap(rows);
+  const priceAboveVwap = Number.isFinite(vwap) ? price >= vwap : bullishStack;
+  const currentRange = Number(latest.high || latest.close) - Number(latest.low || latest.close);
+  const currentCandleStrength = currentRange > 0 ? (price - Number(latest.open || price)) / currentRange : 0;
+  const recentCompressionHigh = Math.max(...rows.slice(-5, -2).map((row) => Number(row.high || row.close)));
+  const recentCompressionLow = Math.min(...rows.slice(-5, -2).map((row) => Number(row.low || row.close)));
+  const compressionWidthPct = recentCompressionLow > 0 ? ((recentCompressionHigh - recentCompressionLow) / recentCompressionLow) * 100 : 99;
+  const consolidationThenPush = compressionWidthPct <= 1.6 && breakingRecentHigh && continuationCandle;
+  const dollarVolume = Number(latest.volume || 0) * price;
 
   let score = 0;
   if (price > shortEma) score += 20;
@@ -3175,10 +3243,34 @@ function analyzeMomentumCandles(candles, symbol = "") {
     breaking_recent_high: breakingRecentHigh,
     continuation_candle: continuationCandle,
     bullish_stack: bullishStack,
+    vwap: roundNumber(vwap, 4),
+    price_above_vwap: priceAboveVwap,
+    current_candle_strength: roundNumber(currentCandleStrength, 3),
+    day_green: momentumDay > 0,
+    dollar_volume: roundNumber(dollarVolume, 2),
+    consolidation_then_push: consolidationThenPush,
     momentum_score: score,
     trend_label: trendLabel,
     momentum_reason: momentumReason
   };
+}
+
+function computeSessionVwap(rows = []) {
+  let cumulativeVolume = 0;
+  let cumulativePriceVolume = 0;
+
+  for (const row of rows) {
+    const high = Number(row.high || row.close);
+    const low = Number(row.low || row.close);
+    const close = Number(row.close);
+    const volume = Number(row.volume || 0);
+    if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close) || !Number.isFinite(volume)) continue;
+    const typicalPrice = (high + low + close) / 3;
+    cumulativePriceVolume += typicalPrice * volume;
+    cumulativeVolume += volume;
+  }
+
+  return cumulativeVolume > 0 ? cumulativePriceVolume / cumulativeVolume : NaN;
 }
 
 async function getBitcoinPulseContext(refresh = false) {
@@ -3364,7 +3456,13 @@ function buildMomentumSignals(candidates, strictSignals, request) {
   const strictByTicker = new Map(strictSignals.map((signal) => [signal.ticker, signal]));
 
   return candidates
-    .map((candidate) => createMomentumSignal(candidate, strictByTicker.get(candidate.symbol), request))
+    .flatMap((candidate) => {
+      const strictSignal = strictByTicker.get(candidate.symbol);
+      return [
+        createMomentumSignal(candidate, strictSignal, request),
+        createIntertradeSignal(candidate, strictSignal, request)
+      ];
+    })
     .filter(Boolean);
 }
 
@@ -3455,6 +3553,166 @@ function createMomentumSignal(candidate, strictSignal, request) {
   };
 }
 
+function createIntertradeSignal(candidate, strictSignal, request) {
+  const ticker = candidate?.symbol;
+  const context = candidate?.momentum_context;
+  const sourceMode = request.mode === "all" ? inferSourceMode(ticker) : request.mode;
+  const assetClass = request.mode === "all" ? inferAssetClass(ticker) : request.modeConfig.assetClass;
+  if (!ticker || !context?.ok) return null;
+  if (sourceMode !== "intraday" || assetClass !== "equity") return null;
+
+  const price = Number(candidate.current || context.price || 0);
+  const dayChange = Number(candidate.changePercent ?? context.recent_change_day ?? 0);
+  const volumeRatio = Number(context.volume_ratio || 0);
+  const ema9 = Number(context.ema9 || price);
+  const ema20 = Number(context.ema20 || price);
+  const vwap = Number(context.vwap || price);
+  const recentHigh = Number(context.recent_high || price);
+  const recentLow = Number(context.recent_low || price);
+  const candleStrength = Number(context.current_candle_strength || 0);
+  const dollarVolume = Number(context.dollar_volume || 0);
+  const rangePosition = Number(candidate.rangePosition ?? (recentHigh > recentLow ? (price - recentLow) / (recentHigh - recentLow) : 0.5));
+  const commodityPenalty = ["UNG", "USO"].includes(ticker) ? 18 : getSymbolSector(ticker) === "commodities" ? 8 : 0;
+  const liquidityPenalty = dollarVolume > 750_000 ? 0 : dollarVolume > 350_000 ? 6 : 14;
+
+  if (!Number.isFinite(price) || price <= 0) return null;
+  if (dayChange <= 0 || !context.price_above_vwap) return null;
+  if (!context.bullish_stack) return null;
+  if (!context.breaking_recent_high && !context.higher_highs && !["continuation", "strong uptrend"].includes(String(context.trend_label || ""))) return null;
+  if (!context.higher_lows && Number(context.recent_change_4 || 0) < 0.6) return null;
+  if (candleStrength <= -0.05 || volumeRatio < 0.9) return null;
+
+  const breakoutScore = Math.max(0, Math.min(100, Math.round(
+    30 * (context.breaking_recent_high ? 1 : 0) +
+    24 * Math.max(0, Math.min(1, rangePosition)) +
+    22 * (context.consolidation_then_push ? 1 : 0) +
+    14 * (price >= recentHigh * 0.998 ? 1 : 0) +
+    10 * Math.max(0, Math.min(1, dayChange / 1.2))
+  )));
+
+  const continuationScore = Math.max(0, Math.min(100, Math.round(
+    24 * (context.bullish_stack ? 1 : 0) +
+    18 * (context.higher_highs ? 1 : 0) +
+    16 * (context.higher_lows ? 1 : 0) +
+    16 * Math.max(0, Math.min(1, Number(context.recent_change_1 || 0) / 0.8)) +
+    14 * Math.max(0, Math.min(1, Number(context.recent_change_4 || 0) / 1.5)) +
+    12 * Math.max(0, Math.min(1, candleStrength))
+  )));
+
+  const volumeScoreBase = Math.round(
+    58 * Math.max(0, Math.min(1.2, volumeRatio / 1.15)) +
+    12 * Math.max(0, Math.min(1, dollarVolume / 2_000_000)) +
+    18 * (context.price_above_vwap ? 1 : 0) +
+    12 * Math.max(0, Math.min(1, dayChange / 1))
+  );
+  const volumeStrengthBonus = volumeRatio >= 1.05 ? 10 : volumeRatio >= 0.98 ? 6 : 0;
+  const volumeScore = Math.max(0, Math.min(100, volumeScoreBase + volumeStrengthBonus - commodityPenalty - liquidityPenalty));
+
+  const entryPrice = Math.max(
+    Math.min(price, recentHigh * 0.999),
+    Math.max(ema9, vwap, price * 0.996)
+  );
+  const entryDistancePct = entryPrice > 0 ? Math.abs(price - entryPrice) / entryPrice * 100 : 99;
+  const entryTimingScore = Math.max(0, Math.min(100, Math.round(
+    52 * Math.max(0, 1 - (entryDistancePct / 1.2)) +
+    18 * (price >= ema9 ? 1 : 0) +
+    15 * (price >= vwap ? 1 : 0) +
+    15 * (price <= recentHigh * 1.003 ? 1 : 0)
+  )));
+
+  const rawStop = Math.max(ema20, recentLow, entryPrice * (1 - INTERTRADE_MAX_STOP_PCT / 100));
+  const stopPrice = Math.min(entryPrice * (1 - 0.012), rawStop);
+  if (!Number.isFinite(stopPrice) || stopPrice <= 0 || stopPrice >= entryPrice) return null;
+
+  const risk = entryPrice - stopPrice;
+  const target1 = entryPrice + risk * 1.6;
+  const target2 = entryPrice + risk * 2.3;
+  const rr1 = risk > 0 ? (target1 - entryPrice) / risk : 0;
+  const rr2 = risk > 0 ? (target2 - entryPrice) / risk : 0;
+  const stopPct = risk > 0 ? (risk / entryPrice) * 100 : 99;
+  const riskRewardScore = Math.max(0, Math.min(100, Math.round(
+    40 * Math.max(0, Math.min(1, rr1 / 1.5)) +
+    34 * Math.max(0, Math.min(1, rr2 / 2)) +
+    16 * Math.max(0, Math.min(1, 1 - (stopPct / INTERTRADE_MAX_STOP_PCT))) +
+    10 * Math.max(0, Math.min(1, 1 - (entryDistancePct / INTERTRADE_MAX_ENTRY_DISTANCE_PCT)))
+  )));
+
+  const intertradeScore = Math.max(0, Math.min(100, Math.round(
+    breakoutScore * 0.26 +
+    continuationScore * 0.26 +
+    volumeScore * 0.18 +
+    entryTimingScore * 0.16 +
+    riskRewardScore * 0.14 -
+    commodityPenalty * 0.4 -
+    liquidityPenalty * 0.4
+  )));
+  if (intertradeScore < 65) return null;
+
+  const extended = entryDistancePct > INTERTRADE_MAX_ENTRY_DISTANCE_PCT || price > recentHigh * 1.004;
+  const reason = !context.breaking_recent_high
+    ? "Momentum building, but wait for breakout confirmation."
+    : extended
+      ? "Momentum strong, but extended. Wait for pullback."
+      : volumeScore >= INTERTRADE_MIN_VOLUME_SCORE
+        ? "Strong breakout with volume confirmation."
+        : "Above VWAP and holding near highs.";
+
+  return {
+    signal_id: createSignalId(request.mode, ticker, request.createdAt || new Date().toISOString(), `intertrade:${intertradeScore}:${entryPrice}`),
+    ticker,
+    mode: request.mode,
+    signal_mode: sourceMode,
+    asset_class: assetClass,
+    price: candidate.current ?? null,
+    active_price: candidate.active_price ?? candidate.current ?? null,
+    active_price_label: candidate.active_price_label ?? "",
+    regular_market_price: candidate.regular_market_price ?? null,
+    premarket_price: candidate.premarket_price ?? null,
+    afterhours_price: candidate.afterhours_price ?? null,
+    extended_hours_price: candidate.extended_hours_price ?? null,
+    extended_hours_session: candidate.extended_hours_session ?? null,
+    extended_hours_note: candidate.extended_hours_note ?? "",
+    change_pct: candidate.changePercent ?? null,
+    score: candidate.score ?? null,
+    rangePosition: candidate.rangePosition ?? null,
+    signal_type: "intertrade_take",
+    bias: "bullish",
+    entry: formatNumber(entryPrice),
+    stop: formatNumber(stopPrice),
+    target1: formatNumber(target1),
+    target2: formatNumber(target2),
+    confidence: Math.max(INTERTRADE_MIN_CONFIDENCE, Math.min(9, Math.round(intertradeScore / 11))),
+    bull_run_flag: true,
+    buy_trigger: `Buy only if ${ticker} stays near ${formatNumber(entryPrice)} and holds above VWAP.`,
+    sell_trigger: `Exit if ${ticker} loses ${formatNumber(stopPrice)}.`,
+    hold_window: "intraday paper trade",
+    setup_score: Math.max(70, Math.min(100, intertradeScore)),
+    momentum_score: Math.max(Number(context.momentum_score || 0), continuationScore),
+    trend_label: context.breaking_recent_high ? "breakout" : context.trend_label || "continuation",
+    momentum_reason: reason,
+    reason,
+    invalid_if: `Rejected breakout or loss of ${formatNumber(stopPrice)}.`,
+    breakout_score: breakoutScore,
+    continuation_score: continuationScore,
+    volume_score: volumeScore,
+    entry_timing_score: entryTimingScore,
+    risk_reward_score: riskRewardScore,
+    intertrade_score: intertradeScore,
+    entry_distance_pct_override: roundNumber(entryDistancePct, 3),
+    intertrade_engine: {
+      vwap: Number.isFinite(vwap) ? roundNumber(vwap, 4) : null,
+      ema9: Number.isFinite(ema9) ? roundNumber(ema9, 4) : null,
+      ema20: Number.isFinite(ema20) ? roundNumber(ema20, 4) : null,
+      volume_ratio: roundNumber(volumeRatio, 3),
+      current_candle_strength: roundNumber(candleStrength, 3),
+      price_above_vwap: Boolean(context.price_above_vwap),
+      near_day_high: price >= recentHigh * 0.998,
+      consolidation_then_push: Boolean(context.consolidation_then_push),
+      strict_take_present: Boolean(strictSignal?.final_decision === "take")
+    }
+  };
+}
+
 function inferSourceMode(ticker) {
   if (CRYPTO_UNIVERSE.includes(normalizeMarketTicker(ticker)) || CRYPTO_SYMBOLS[normalizeMarketTicker(ticker)]) return "crypto";
   if (INDEX_SYMBOLS[ticker]) return "futures";
@@ -3530,9 +3788,11 @@ function createSignalId(mode, ticker, timestamp, seed = "") {
 }
 
 function formatWebullSummary(signal) {
-  const signalLabel = signal.signal_type === "momentum_take"
-    ? "MOMENTUM"
-    : String(signal.final_decision || "watch").toUpperCase();
+  const signalLabel = signal.signal_type === "intertrade_take"
+    ? "INTERTRADE"
+    : signal.signal_type === "momentum_take"
+      ? "MOMENTUM"
+      : String(signal.final_decision || "watch").toUpperCase();
   return `${signal.ticker} | ${signal.signal_mode || signal.mode || "signal"} | ${signalLabel} | ${signal.bias} | ENTRY ${signal.entry} | STOP ${signal.stop} | T1 ${signal.target1} | T2 ${signal.target2} | SELL ${signal.sell_trigger || signal.stop} | CONF ${signal.confidence}/10`;
 }
 
@@ -3572,6 +3832,12 @@ function addQualityScores(signal) {
     momentum_score: Number(signal.momentum_score || 0),
     trend_label: signal.trend_label || "",
     momentum_reason: signal.momentum_reason || "",
+    breakout_score: numberOrNull(signal.breakout_score),
+    continuation_score: numberOrNull(signal.continuation_score),
+    volume_score: numberOrNull(signal.volume_score),
+    entry_timing_score: numberOrNull(signal.entry_timing_score),
+    risk_reward_score: numberOrNull(signal.risk_reward_score),
+    intertrade_score: numberOrNull(signal.intertrade_score),
     final_quality_score: finalQualityScore,
     signal_age_seconds: signalTiming.ageSeconds,
     signal_stale_flag: signalTiming.stale,
@@ -3641,9 +3907,11 @@ function buildExecutionPlan(signal) {
     ? Math.floor(settings.max_position_dollars / entry)
     : 0;
   const rawShares = Math.max(0, Math.min(maxRiskShares || 0, maxPositionShares || 0));
-  const suggestedShares = buyNowType === "momentum_take"
-    ? Math.max(0, Math.floor(rawShares * MOMENTUM_POSITION_SCALE))
-    : rawShares;
+  const suggestedShares = buyNowType === "intertrade_take"
+    ? Math.max(0, Math.floor(rawShares * 0.85))
+    : buyNowType === "momentum_take"
+      ? Math.max(0, Math.floor(rawShares * MOMENTUM_POSITION_SCALE))
+      : rawShares;
   const estimatedPositionDollars = Number.isFinite(entry)
     ? Number((suggestedShares * entry).toFixed(2))
     : 0;
@@ -3658,7 +3926,9 @@ function buildExecutionPlan(signal) {
     : NaN;
   const rr1 = riskPerShare > 0 && Number.isFinite(reward1) ? Number((reward1 / riskPerShare).toFixed(2)) : null;
   const rr2 = riskPerShare > 0 && Number.isFinite(reward2) ? Number((reward2 / riskPerShare).toFixed(2)) : null;
-  const entryDistancePct = Number(signal.entry_distance_pct);
+  const entryDistancePct = signal.entry_distance_pct_override === null || signal.entry_distance_pct_override === undefined
+    ? Number(signal.entry_distance_pct)
+    : Number(signal.entry_distance_pct_override);
   const quality = Number(signal.final_quality_score || 0);
   const confidence = Number(signal.confidence || 0);
   const skipReasons = getExecutionSkipReasons({
@@ -3715,6 +3985,12 @@ function buildExecutionPlan(signal) {
     buy_now_type: buyNowType,
     signal_type: signal.signal_type || "strict_take",
     momentum_score: Number(signal.momentum_score || 0),
+    breakout_score: Number(signal.breakout_score || 0),
+    continuation_score: Number(signal.continuation_score || 0),
+    volume_score: Number(signal.volume_score || 0),
+    entry_timing_score: Number(signal.entry_timing_score || 0),
+    risk_reward_score: Number(signal.risk_reward_score || 0),
+    intertrade_score: Number(signal.intertrade_score || 0),
     trend_label: signal.trend_label || "",
     momentum_reason: signal.momentum_reason || "",
     bitcoin_profile: signal.bitcoin_profile || null,
@@ -3737,7 +4013,11 @@ function formatExecutionSummary(signal, plan, decision) {
   const side = bearish ? "SELL SHORT" : "BUY";
   const entryText = plan.entry !== null ? formatNumber(plan.entry) : String(signal.entry || "");
   const stopText = plan.stop !== null ? formatNumber(plan.stop) : String(signal.stop || "");
-  const banner = plan.buy_now_type === "momentum_take" ? "MOMENTUM" : decision.final_decision.toUpperCase();
+  const banner = plan.buy_now_type === "intertrade_take"
+    ? "INTERTRADE"
+    : plan.buy_now_type === "momentum_take"
+      ? "MOMENTUM"
+      : decision.final_decision.toUpperCase();
 
   return `${signal.ticker} | ${banner} | ${side} ${plan.suggested_shares} @ ${entryText} | STOP ${stopText} | RISK $${plan.estimated_risk_dollars} | RR1 ${plan.reward_risk_target1 ?? "n/a"} | QUALITY ${signal.final_quality_score}`;
 }
@@ -3747,7 +4027,10 @@ function getFinalDecision(signal, executionPlan) {
   const confidence = Number(signal.confidence || 0);
   const rr1 = Number(executionPlan.reward_risk_target1);
   const rr2 = Number(executionPlan.reward_risk_target2);
-  const entryClose = Number(signal.entry_distance_pct) <= 1;
+  const entryDistancePct = signal.entry_distance_pct_override === null || signal.entry_distance_pct_override === undefined
+    ? Number(signal.entry_distance_pct)
+    : Number(signal.entry_distance_pct_override);
+  const entryClose = entryDistancePct <= 1;
   const skipReasons = getDecisionSkipReasons(signal, executionPlan);
   const watchReasons = [];
 
@@ -3788,6 +4071,19 @@ function getFinalDecision(signal, executionPlan) {
 }
 
 function getBuyNowType(signal) {
+  if (signal.signal_type === "intertrade_take") {
+    if (signal.expired_flag || signal.signal_stale_flag) return null;
+    if (Number(signal.confidence || 0) < INTERTRADE_MIN_CONFIDENCE) return null;
+    if (Number(signal.intertrade_score || 0) < INTERTRADE_MIN_SCORE) return null;
+    if (Number(signal.continuation_score || 0) < INTERTRADE_MIN_CONTINUATION_SCORE) return null;
+    if (Number(signal.volume_score || 0) < INTERTRADE_MIN_VOLUME_SCORE) return null;
+    if (Number(signal.risk_reward_score || 0) < INTERTRADE_MIN_RISK_REWARD_SCORE) return null;
+    const entryDistancePct = signal.entry_distance_pct_override === null || signal.entry_distance_pct_override === undefined
+      ? Number(signal.entry_distance_pct)
+      : Number(signal.entry_distance_pct_override);
+    if (!Number.isFinite(entryDistancePct) || entryDistancePct > INTERTRADE_MAX_ENTRY_DISTANCE_PCT) return null;
+    return "intertrade_take";
+  }
   if (signal.signal_type === "momentum_take") {
     if (signal.expired_flag || signal.signal_stale_flag) return null;
     if (Number(signal.confidence || 0) < MOMENTUM_MIN_CONFIDENCE) return null;
@@ -3805,10 +4101,19 @@ function getBuyNowType(signal) {
 }
 
 function buyNowSortScore(a, b) {
-  const rankA = a.buy_now_type === "take" ? 0 : a.buy_now_type === "momentum_take" ? 1 : 2;
-  const rankB = b.buy_now_type === "take" ? 0 : b.buy_now_type === "momentum_take" ? 1 : 2;
+  const rankValue = (item) => item.buy_now_type === "take" ? 0 : item.buy_now_type === "intertrade_take" ? 1 : item.buy_now_type === "momentum_take" ? 2 : 3;
+  const rankA = rankValue(a);
+  const rankB = rankValue(b);
   if (rankA !== rankB) return rankA - rankB;
   if (rankA === 1 || rankB === 1) {
+    const intertradeDelta = Number(b.intertrade_score || 0) - Number(a.intertrade_score || 0);
+    if (intertradeDelta !== 0) return intertradeDelta;
+    const continuationDelta = Number(b.continuation_score || 0) - Number(a.continuation_score || 0);
+    if (continuationDelta !== 0) return continuationDelta;
+    const volumeDelta = Number(b.volume_score || 0) - Number(a.volume_score || 0);
+    if (volumeDelta !== 0) return volumeDelta;
+  }
+  if (rankA === 2 || rankB === 2) {
     const momentumDelta = Number(b.momentum_score || 0) - Number(a.momentum_score || 0);
     if (momentumDelta !== 0) return momentumDelta;
   }
@@ -3842,7 +4147,7 @@ function getDecisionSkipReasons(signal, executionPlan) {
   if (executionPlan.risk_per_share === null || Number(executionPlan.risk_per_share) <= 0) reasons.push("bad risk model");
   if (executionPlan.suggested_shares <= 0) reasons.push("position size is zero");
   if (Number.isFinite(rr1) && rr1 < 1 && (!Number.isFinite(rr2) || rr2 < 1.25)) reasons.push("bad reward/risk");
-  if (signal.regime_alignment === "against_regime") reasons.push("against regime");
+  if (signal.regime_alignment === "against_regime" && signal.signal_type !== "intertrade_take") reasons.push("against regime");
   if (!signal.session_open_flag && !["futures_proxy", "bitcoin_linked"].includes(signal.asset_class) && quality < 80) reasons.push("off-session equity signal");
   if (signal.mtf_confirmation === "weak" && quality < 70) reasons.push("weak multi-timeframe proxy");
 
@@ -3862,7 +4167,7 @@ function getExecutionSkipReasons({ signal, entry, stop, riskPerShare, suggestedS
   if (Number.isFinite(entryDistancePct) && entryDistancePct > 1) reasons.push("entry too far from current price");
   if (rr1 !== null && rr1 < 1) reasons.push("target1 reward/risk below 1");
   if (suggestedShares <= 0) reasons.push("position size is zero under risk settings");
-  if (signal.regime_alignment === "against_regime") reasons.push("against market regime");
+  if (signal.regime_alignment === "against_regime" && signal.signal_type !== "intertrade_take") reasons.push("against market regime");
 
   return [...new Set(reasons)];
 }

@@ -552,7 +552,11 @@ async function renderDashboardHome() {
   const counts = overview.counts || {};
   const signalRows = dedupeSignalsByTicker(latestSignals.signals || []);
   const rankedPlans = dedupePlansByTicker(execution.plans || []);
+  const intertradePlans = (execution.intertrade_plans || []).slice(0, 5);
   const workflow = getHomeWorkflowGroups(signalRows, rankedPlans);
+  const standardReadyNow = workflow.readyNow.filter((plan) => plan.buy_now_type !== "intertrade_take");
+  const intradaySignals = signalRows.filter((signal) => (signal.signal_mode || signal.mode || "") === "intraday");
+  const intradayWorkflow = getSignalsModeGroups("intraday", intradaySignals);
   state.cachedSignals = dedupeSignals(latestSignals.signals || []);
   if (!state.selectedHomeTicker) {
     state.selectedHomeTicker = workflow.readyNow[0]?.ticker || workflow.movingNow[0]?.ticker || workflow.watchlist[0]?.ticker || "";
@@ -586,9 +590,11 @@ async function renderDashboardHome() {
     ${state.ui.isMobile
       ? `
         ${panel("System Status", renderMobileStatusStack({ overview, alerts, executionCount: rankedPlans.length }))}
-        ${panel("Buy Now", workflow.readyNow.length
-          ? renderTradeSection(workflow.readyNow.slice(0, 3), { source: "plan", sectionKind: "ready" })
+        ${panel("Buy Now", standardReadyNow.length
+          ? renderTradeSection(standardReadyNow.slice(0, 3), { source: "plan", sectionKind: "ready" })
           : renderTradeNowEmptyState(workflow.watchlist, signalRows))}
+        ${panel("Fast Live Breakout Candidates", renderIntertradeSection(intertradePlans, signalRows))}
+        ${panel("Intraday Right Now", renderHomeIntradayPanel(intradayWorkflow, intradaySignals))}
         ${panel("Movers", `
           <div class="section-note">Movers are not automatic buys.</div>
           ${renderActionCardGrid(workflow.movingNow.slice(0, 4), "movers")}
@@ -607,8 +613,8 @@ async function renderDashboardHome() {
       `
       : `
         <section class="grid cols-2 dashboard-zones">
-          ${panel("What Can I Trade Right Now?", workflow.readyNow.length
-            ? renderTradeSection(workflow.readyNow.slice(0, 5), { source: "plan", sectionKind: "ready" })
+          ${panel("What Can I Trade Right Now?", standardReadyNow.length
+            ? renderTradeSection(standardReadyNow.slice(0, 5), { source: "plan", sectionKind: "ready" })
             : `${renderTradeNowEmptyState(workflow.watchlist, signalRows)}${workflow.watchlist.length ? `<div class="section-subgrid">${workflow.watchlist.slice(0, 3).map((signal) => renderActionCard(signal, "watch")).join("")}</div>` : ""}`)}
           ${panel("What Is Moving Up Right Now?", `
             <div class="section-note">Movers are not automatic buys. Use them to find charts worth checking.</div>
@@ -616,20 +622,23 @@ async function renderDashboardHome() {
           `)}
         </section>
         <section class="grid cols-2 dashboard-zones">
-          ${panel("Good Ideas, But Not Buys Yet", renderActionCardGrid(workflow.watchlist.slice(0, 6), "watch"))}
-          ${panel("ChatGPT Decision Desk", `
-            <div class="brain-summary">
-              <div class="brain-chip ${ai.connected ? "good" : "bad"}">AI Brain ${ai.connected ? "Online" : "Offline"}</div>
-              <div class="brain-chip ${regime.regime === "bullish" ? "good" : regime.regime === "bearish" ? "bad" : "neutral"}">Regime ${escapeHtml(regime.regime || "unknown")}</div>
-              <div class="brain-chip neutral">${session.active_dashboard_sessions || 0} live session${session.active_dashboard_sessions === 1 ? "" : "s"}</div>
-            </div>
-            ${renderTradingAssistantChat("What can I trade right now, what is moving, and what should I avoid?")}
-          `)}
+          ${panel("Fast Live Breakout Candidates", renderIntertradeSection(intertradePlans, signalRows))}
+          ${panel("Intraday Trade Board", renderHomeIntradayPanel(intradayWorkflow, intradaySignals))}
         </section>
+        ${panel("Good Ideas, But Not Buys Yet", renderActionCardGrid(workflow.watchlist.slice(0, 6), "watch"))}
+        ${panel("ChatGPT Decision Desk", `
+          <div class="brain-summary">
+            <div class="brain-chip ${ai.connected ? "good" : "bad"}">AI Brain ${ai.connected ? "Online" : "Offline"}</div>
+            <div class="brain-chip ${regime.regime === "bullish" ? "good" : regime.regime === "bearish" ? "bad" : "neutral"}">Regime ${escapeHtml(regime.regime || "unknown")}</div>
+            <div class="brain-chip neutral">${session.active_dashboard_sessions || 0} live session${session.active_dashboard_sessions === 1 ? "" : "s"}</div>
+          </div>
+          ${renderTradingAssistantChat("What can I trade right now, what is moving, and what should I avoid?")}
+        `)}
         ${panel("Ignore For Now", renderActionCardGrid(workflow.avoid.slice(0, 8), "skip", true))}
         ${renderAdvancedDetails("Advanced Details", renderSignalTable(signalRows.slice(0, 12), { compact: true }))}
       `}
   `;
+  maybeAutoRunEmptySectionScan("intraday", intradaySignals);
   document.querySelector("#power-toggle")?.addEventListener("click", () => setPower(!state.powerOn));
   document.querySelector("#run-fresh-scan")?.addEventListener("click", (event) => {
     void runFreshScan("all", { triggerButton: event.currentTarget });
@@ -644,16 +653,57 @@ async function renderDashboardHome() {
   bindTradingAssistant();
 }
 
+function renderHomeIntradayPanel(groups = {}, intradaySignals = []) {
+  const readyNow = groups.readyNow || [];
+  const movingNow = groups.movingNow || [];
+  const watchOnly = groups.watchOnly || [];
+  if (readyNow.length) {
+    return `
+      <div class="section-note">These are the best same-day setups on the board right now.</div>
+      ${renderActionCardGrid(readyNow.slice(0, 4), "watch")}
+    `;
+  }
+  if (movingNow.length || watchOnly.length) {
+    const candidates = dedupeSignalsByTicker([...(movingNow || []), ...(watchOnly || [])]).slice(0, 4);
+    return `
+      <div class="section-note">Nothing is clean enough to chase yet. These are the best intraday names to monitor on the main screen.</div>
+      ${renderActionCardGrid(candidates, "watch")}
+    `;
+  }
+  return renderMeaningfulEmptyState("signals", "intraday", { signals: intradaySignals });
+}
+
+function renderIntertradeSection(plans = [], fallbackSignals = []) {
+  if (plans.length) {
+    return `
+      <div class="section-note">Top live breakout-continuation names only. Confirm the chart before acting.</div>
+      ${renderTradeSection(plans.slice(0, 5), { source: "plan", sectionKind: "ready" })}
+    `;
+  }
+  const fallback = (fallbackSignals || [])
+    .filter((signal) => signal.signal_type === "intertrade_take")
+    .slice(0, 5);
+  if (fallback.length) {
+    return `
+      <div class="section-note">Momentum is visible, but these are not clean enough to buy yet.</div>
+      ${renderActionCardGrid(fallback, "watch")}
+    `;
+  }
+  return noTradeState("No clean live breakout candidate right now.");
+}
+
 async function renderBuyNow() {
   const [execution, overview] = await Promise.all([
     getJson("/api/dashboard/execution"),
     getJson("/api/dashboard/overview")
   ]);
   const plans = dedupePlansByTicker(execution.plans || []);
+  const intertradePlans = (execution.intertrade_plans || []).slice(0, 5);
   const signalData = await getJson("/api/dashboard/signals?hideExpired=1&sort=quality");
   const signalRows = dedupeSignalsByTicker(signalData.signals || []);
   state.cachedSignals = dedupeSignals(signalData.signals || []);
   const groups = getExecutionGroups(plans, signalRows);
+  const standardReadyNow = groups.readyNow.filter((plan) => plan.buy_now_type !== "intertrade_take");
   content.innerHTML = `
     <section class="page-intro">
       <div>
@@ -666,8 +716,9 @@ async function renderBuyNow() {
         <span>Start with Ready Now, then check Wait for Pullback, then scan Strong Momentum without treating every mover like a buy.</span>
       </div>
     </section>
-    ${panel("Ready Now", groups.readyNow.length
-      ? renderTradeSection(groups.readyNow.slice(0, 5), { source: "plan", sectionKind: "ready" })
+    ${panel("Fast Live Breakout Candidates", renderIntertradeSection(intertradePlans, signalRows))}
+    ${panel("Ready Now", standardReadyNow.length
+      ? renderTradeSection(standardReadyNow.slice(0, 5), { source: "plan", sectionKind: "ready" })
       : renderTradeNowEmptyState(groups.watchOnly, signalRows))}
     ${panel("Wait For Pullback", renderTradeSection(groups.waitForPullback.slice(0, 5), { source: "plan", sectionKind: "pullback" }))}
     ${panel("Strong Momentum", renderActionCardGrid(groups.strongMomentum.slice(0, 10), "movers"))}
@@ -676,8 +727,8 @@ async function renderBuyNow() {
     ${renderAdvancedDetails("Advanced Details", renderSignalTable(signalRows.slice(0, 12), { compact: true }))}
   `;
   updateSystemHealthBadge({
-    label: groups.readyNow.length ? `${groups.readyNow.length} ready now` : "No trade now",
-    tone: groups.readyNow.length ? "good" : "neutral",
+    label: standardReadyNow.length || intertradePlans.length ? `${standardReadyNow.length + intertradePlans.length} ready now` : "No trade now",
+    tone: standardReadyNow.length || intertradePlans.length ? "good" : "neutral",
     detail: "buy now"
   });
 }
@@ -922,15 +973,21 @@ async function renderSignals(mode) {
   if (state.signals.minQuality) query.set("minQuality", "70");
   if (state.signals.hideExpired) query.set("hideExpired", "1");
   const data = await getJson(`/api/dashboard/signals?${query}`);
+  const signals = dedupeSignalsByTicker(data.signals || []);
   state.cachedSignals = dedupeSignals(data.signals || []);
-  const sectionEmptyState = renderMeaningfulEmptyState("signals", mode, { signals: data.signals || [] });
+  const sectionEmptyState = renderMeaningfulEmptyState("signals", mode, { signals });
+  const signalGroups = getSignalsModeGroups(mode, signals);
+  const modeTitle = mode === "intraday" ? "Intraday trade board in plain English." : `${capitalize(mode)} signals in plain English.`;
+  const modeDescription = mode === "intraday"
+    ? "Start with what is closest to an entry right now, then check movers and watches instead of reading a flat scanner list."
+    : "Start with the cards first. The detailed table is still here if you want the extra fields.";
 
   content.innerHTML = `
     <section class="page-intro">
       <div>
         <p class="eyebrow">${capitalize(mode)}</p>
-        <h3>${capitalize(mode)} signals in plain English.</h3>
-        <p>Start with the cards first. The detailed table is still here if you want the extra fields.</p>
+        <h3>${modeTitle}</h3>
+        <p>${modeDescription}</p>
       </div>
       <div class="rule-box">
         <strong>How to read this</strong>
@@ -943,19 +1000,77 @@ async function renderSignals(mode) {
         <span class="small">${data.count} signals</span>
       </div>
       ${renderSignalToolbar(mode)}
-      ${(data.signals || []).length
-        ? renderActionCardGrid((data.signals || []).slice(0, 12), mode === "bitcoin" ? "movers" : "watch")
+      ${signals.length
+        ? renderSignalsModeLayout(mode, signalGroups)
         : sectionEmptyState}
     </section>
-    ${renderAdvancedDetails("Advanced Details", (data.signals || []).length ? renderSignalTable(data.signals || []) : sectionEmptyState)}
+    ${renderAdvancedDetails("Advanced Details", signals.length ? renderSignalTable(signals) : sectionEmptyState)}
   `;
-  maybeAutoRunEmptySectionScan(mode, data.signals || []);
+  maybeAutoRunEmptySectionScan(mode, signals);
   bindSignalToolbar();
   updateSystemHealthBadge({
     label: `${capitalize(mode)} ${data.count}`,
     tone: data.count ? "good" : "neutral",
     detail: "signals"
   });
+}
+
+function getSignalsModeGroups(mode, signals = []) {
+  if (mode === "intraday") {
+    const used = new Set();
+    const readyNow = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => getTimingProfile(signal).isReadyNow)), used);
+    markUsedTickers(used, readyNow);
+    const movingNow = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
+      const timing = getTimingProfile(signal);
+      return !timing.isSkip && isMovingUpCandidate(signal);
+    })), used);
+    markUsedTickers(used, movingNow);
+    const watchOnly = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
+      const timing = getTimingProfile(signal);
+      return !timing.isReadyNow && !timing.isSkip;
+    })), used);
+    markUsedTickers(used, watchOnly);
+    const skip = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => getTimingProfile(signal).isSkip)), used);
+    return {
+      readyNow,
+      movingNow,
+      watchOnly,
+      skip
+    };
+  }
+
+  const used = new Set();
+  const primary = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
+    const timing = getTimingProfile(signal);
+    return !timing.isSkip;
+  })), used);
+  markUsedTickers(used, primary);
+  const skip = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => getTimingProfile(signal).isSkip)), used);
+  return {
+    primary,
+    skip
+  };
+}
+
+function renderSignalsModeLayout(mode, groups = {}) {
+  if (mode === "intraday") {
+    return `
+      ${panel("Ready Right Now", groups.readyNow?.length
+        ? renderActionCardGrid(groups.readyNow.slice(0, 5), "watch")
+        : renderTradeNowEmptyState(groups.watchOnly || [], [...(groups.movingNow || []), ...(groups.watchOnly || [])]))}
+      ${panel("Moving Now", `
+        <div class="section-note">These are the best intraday movers to inspect right now. They are not all instant buys.</div>
+        ${renderActionCardGrid((groups.movingNow || []).slice(0, 8), "movers")}
+      `)}
+      ${panel("Watch For Entry", renderActionCardGrid((groups.watchOnly || []).slice(0, 8), "watch"))}
+      ${panel("Avoid For Now", renderActionCardGrid((groups.skip || []).slice(0, 8), "skip", true))}
+    `;
+  }
+
+  return `
+    ${renderActionCardGrid((groups.primary || []).slice(0, 12), mode === "bitcoin" ? "movers" : "watch")}
+    ${groups.skip?.length ? panel("Avoid For Now", renderActionCardGrid(groups.skip.slice(0, 8), "skip", true)) : ""}
+  `;
 }
 
 async function renderAlerts() {
@@ -1339,7 +1454,7 @@ function renderActionCard(signal, kind = "watch") {
       </div>
       <div class="action-meta">
         <span>${escapeHtml(signal.trend_label || getTrendLabel(signal))}</span>
-        <span>${escapeHtml(signal.signal_type === "momentum_take" ? "momentum engine" : signal.final_decision || "scanner")}</span>
+        <span>${escapeHtml(getSignalEngineLabel(signal))}</span>
         <span>${escapeHtml(sessionPriceText(signal))}</span>
       </div>
       <div class="hero-numbers">
@@ -1351,9 +1466,17 @@ function renderActionCard(signal, kind = "watch") {
       <div class="score-row">
         <div><span>What to do</span><strong>${escapeHtml(timing.guidanceLabel)}</strong></div>
         <div><span>Timing</span><strong>${escapeHtml(timing.label)}</strong></div>
-        <div><span>Confidence</span><strong>${fmt(signal.confidence)}</strong></div>
-        <div><span>Quality</span><strong>${fmt(signal.final_quality_score)}</strong></div>
+        <div><span>${signal.signal_type === "intertrade_take" ? "Intertrade" : "Confidence"}</span><strong>${fmt(signal.signal_type === "intertrade_take" ? signal.intertrade_score : signal.confidence)}</strong></div>
+        <div><span>${signal.signal_type === "intertrade_take" ? "Continuation" : "Quality"}</span><strong>${fmt(signal.signal_type === "intertrade_take" ? signal.continuation_score : signal.final_quality_score)}</strong></div>
       </div>
+      ${signal.signal_type === "intertrade_take" ? `
+        <div class="score-row">
+          <div><span>Breakout</span><strong>${fmt(signal.breakout_score)}</strong></div>
+          <div><span>Volume</span><strong>${fmt(signal.volume_score)}</strong></div>
+          <div><span>Entry timing</span><strong>${fmt(signal.entry_timing_score)}</strong></div>
+          <div><span>Risk / reward</span><strong>${fmt(signal.risk_reward_score)}</strong></div>
+        </div>
+      ` : ""}
       <p class="reason-line">${escapeHtml(reason)}</p>
       <div class="next-step-note">
         <strong>What to do:</strong>
@@ -1415,20 +1538,29 @@ function getTrendLabel(signal) {
   return "watching";
 }
 
+function getSignalEngineLabel(signal = {}) {
+  if (signal.signal_type === "intertrade_take" || signal.buy_now_type === "intertrade_take") return "breakout continuation engine";
+  if (signal.signal_type === "momentum_take" || signal.buy_now_type === "momentum_take") return "momentum engine";
+  return signal.final_decision || "scanner";
+}
+
 function getSignalBadgeLabel(signal, fallbackDecision = "watch") {
+  if (signal.signal_type === "intertrade_take" || signal.buy_now_type === "intertrade_take") return "INTERTRADE";
   if (signal.signal_type === "momentum_take" || signal.buy_now_type === "momentum_take") return "MOMENTUM";
   return String(fallbackDecision || signal.final_decision || "watch").toUpperCase();
 }
 
 function getSignalBadgeClass(signal, fallbackDecision = "watch") {
+  if (signal.signal_type === "intertrade_take" || signal.buy_now_type === "intertrade_take") return "take";
   if (signal.signal_type === "momentum_take" || signal.buy_now_type === "momentum_take") return "momentum";
   return String(fallbackDecision || signal.final_decision || "watch").toLowerCase();
 }
 
 function getBuyNowDisplayRank(signal = {}) {
   if (signal.buy_now_type === "take" || signal.final_decision === "take") return 0;
-  if (signal.buy_now_type === "momentum_take" || signal.signal_type === "momentum_take") return 1;
-  return 2;
+  if (signal.buy_now_type === "intertrade_take" || signal.signal_type === "intertrade_take") return 1;
+  if (signal.buy_now_type === "momentum_take" || signal.signal_type === "momentum_take") return 2;
+  return 3;
 }
 
 function getPlainSignalReason(signal, kind = "watch") {
@@ -1497,7 +1629,7 @@ function getTimingProfile(item = {}) {
   const entry = parseNumericValue(item.entry || item.buy_trigger);
   const expired = Boolean(item.expired_flag);
   const finalDecision = String(item.final_decision || item.action || "watch").toLowerCase();
-  const hasMomentumLane = item.buy_now_type === "momentum_take" || item.signal_type === "momentum_take";
+  const hasMomentumLane = ["momentum_take", "intertrade_take"].includes(item.buy_now_type) || ["momentum_take", "intertrade_take"].includes(item.signal_type);
   const deltaPct = Number.isFinite(current) && Number.isFinite(entry) && entry !== 0
     ? ((current - entry) / entry) * 100
     : NaN;
@@ -1644,24 +1776,53 @@ function dedupePlansByTicker(plans = []) {
   return [...byTicker.values()];
 }
 
+function uniqueTickerKey(item = {}) {
+  return normalizeDisplayTicker(item.ticker || item.symbol || "");
+}
+
+function excludeUsedTickers(items = [], used = new Set()) {
+  return items.filter((item) => {
+    const key = uniqueTickerKey(item);
+    return key && !used.has(key);
+  });
+}
+
+function markUsedTickers(used = new Set(), items = []) {
+  for (const item of items) {
+    const key = uniqueTickerKey(item);
+    if (key) used.add(key);
+  }
+  return used;
+}
+
 function getExecutionGroups(plans = [], signals = []) {
-  const readyNow = [];
-  const waitForPullback = [];
-  const watchOnly = [];
-  const skip = [];
+  const rawReadyNow = [];
+  const rawWaitForPullback = [];
+  const rawWatchOnly = [];
+  const rawSkip = [];
 
   for (const plan of plans) {
     const timing = getTimingProfile(plan);
-    if (timing.isReadyNow) readyNow.push(plan);
-    else if (timing.isPullback) waitForPullback.push(plan);
-    else if (timing.isWatch) watchOnly.push(plan);
-    else skip.push(plan);
+    if (timing.isReadyNow) rawReadyNow.push(plan);
+    else if (timing.isPullback) rawWaitForPullback.push(plan);
+    else if (timing.isWatch) rawWatchOnly.push(plan);
+    else rawSkip.push(plan);
   }
 
-  const strongMomentum = dedupeSignalsByTicker(signals.filter((signal) => {
+  const used = new Set();
+  const readyNow = excludeUsedTickers(dedupePlansByTicker(rawReadyNow), used);
+  markUsedTickers(used, readyNow);
+  const waitForPullback = excludeUsedTickers(dedupePlansByTicker(rawWaitForPullback), used);
+  markUsedTickers(used, waitForPullback);
+  const watchOnly = excludeUsedTickers(dedupePlansByTicker(rawWatchOnly), used);
+  markUsedTickers(used, watchOnly);
+  const skip = excludeUsedTickers(dedupePlansByTicker(rawSkip), used);
+  const planTickerSet = markUsedTickers(new Set(), [...readyNow, ...waitForPullback, ...watchOnly]);
+
+  const strongMomentum = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
     const timing = getTimingProfile(signal);
     return !timing.isSkip && (signal.signal_type === "momentum_take" || Number(signal.momentum_score || 0) >= 70 || isMovingUpCandidate(signal));
-  }));
+  })), planTickerSet);
 
   return {
     readyNow,
@@ -1674,15 +1835,18 @@ function getExecutionGroups(plans = [], signals = []) {
 
 function getHomeWorkflowGroups(signals = [], plans = []) {
   const executionGroups = getExecutionGroups(plans, signals);
-  const movingNow = dedupeSignalsByTicker(signals.filter((signal) => {
+  const used = markUsedTickers(new Set(), executionGroups.readyNow);
+  const movingNow = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
     const timing = getTimingProfile(signal);
     return !timing.isSkip && (isMovingUpCandidate(signal) || timing.isPullback || timing.isReadyNow);
-  }));
-  const watchlist = dedupeSignalsByTicker(signals.filter((signal) => {
+  })), used);
+  markUsedTickers(used, movingNow);
+  const watchlist = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
     const timing = getTimingProfile(signal);
     return !timing.isReadyNow && !timing.isSkip;
-  }));
-  const avoid = dedupeSignalsByTicker(signals.filter((signal) => getTimingProfile(signal).isSkip || signal.final_decision === "skip"));
+  })), used);
+  markUsedTickers(used, watchlist);
+  const avoid = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => getTimingProfile(signal).isSkip || signal.final_decision === "skip")), used);
   return {
     readyNow: executionGroups.readyNow,
     movingNow,
@@ -1692,17 +1856,25 @@ function getHomeWorkflowGroups(signals = [], plans = []) {
 }
 
 function getMoverGroups(signals = []) {
+  const used = new Set();
+  const uptrendNow = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
+    const timing = getTimingProfile(signal);
+    return !timing.isSkip && !timing.isPullback && isMovingUpCandidate(signal);
+  })), used);
+  markUsedTickers(used, uptrendNow);
+  const nearBreakout = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => {
+    const timing = getTimingProfile(signal);
+    return timing.isWatch || String(signal.trend_label || "").includes("breakout");
+  })), used);
+  markUsedTickers(used, nearBreakout);
+  const pullbackWatch = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => getTimingProfile(signal).isPullback)), used);
+  markUsedTickers(used, pullbackWatch);
+  const downtrendAvoid = excludeUsedTickers(dedupeSignalsByTicker(signals.filter((signal) => isBearishSignal(signal) || getTimingProfile(signal).isSkip)), used);
   return {
-    uptrendNow: dedupeSignalsByTicker(signals.filter((signal) => {
-      const timing = getTimingProfile(signal);
-      return !timing.isSkip && !timing.isPullback && isMovingUpCandidate(signal);
-    })),
-    nearBreakout: dedupeSignalsByTicker(signals.filter((signal) => {
-      const timing = getTimingProfile(signal);
-      return timing.isWatch || String(signal.trend_label || "").includes("breakout");
-    })),
-    pullbackWatch: dedupeSignalsByTicker(signals.filter((signal) => getTimingProfile(signal).isPullback)),
-    downtrendAvoid: dedupeSignalsByTicker(signals.filter((signal) => isBearishSignal(signal) || getTimingProfile(signal).isSkip))
+    uptrendNow,
+    nearBreakout,
+    pullbackWatch,
+    downtrendAvoid
   };
 }
 
@@ -1997,12 +2169,15 @@ function getLatestNewsTicker(news = {}) {
 }
 
 function maybeAutoRunEmptySectionScan(mode, signals = []) {
-  if (mode !== "swing" || signals.length || !state.powerOn) return;
+  if (!["intraday", "swing"].includes(mode) || signals.length || !state.powerOn) return;
   const lastRunAt = Number(state.ui.emptyAutoScanAt[mode] || 0);
   if (Date.now() - lastRunAt < 60_000) return;
   state.ui.emptyAutoScanAt[mode] = Date.now();
-  showMessage("No swing setup qualifies yet. Running a fresh swing scan...");
-  void runFreshScan("swing");
+  const isIntraday = mode === "intraday";
+  showMessage(isIntraday
+    ? "No intraday setup qualifies yet. Running a fresh intraday scan..."
+    : "No swing setup qualifies yet. Running a fresh swing scan...");
+  void runFreshScan(mode);
 }
 
 function renderSignalToolbar(mode) {
@@ -2130,6 +2305,7 @@ function renderSignalCards(signals) {
 function renderExecutionCard(plan) {
   const timing = getTimingProfile(plan);
   const assetTone = getAssetToneClass(plan.asset_class);
+  const isIntertrade = plan.buy_now_type === "intertrade_take" || plan.signal_type === "intertrade_take";
   return `
     <article class="trade-card take-row ${escapeAttr(timing.cardDecision)} ${assetTone}">
       <div class="card-title">
@@ -2154,11 +2330,19 @@ function renderExecutionCard(plan) {
         <div><span>Quality</span><strong>${fmt(plan.final_quality_score)}</strong></div>
       </div>
       <div class="score-row">
-        <div><span>Trend</span><strong>${escapeHtml(plan.trend_label || getTrendLabel(plan))}</strong></div>
-        <div><span>Momentum</span><strong>${fmt(plan.momentum_score)}</strong></div>
-        <div><span>Shares</span><strong>${plan.suggested_shares || 0}</strong></div>
-        <div><span>RR1 / RR2</span><strong>${fmt(plan.reward_risk_target1)} / ${fmt(plan.reward_risk_target2)}</strong></div>
+        <div><span>${isIntertrade ? "Intertrade" : "Trend"}</span><strong>${isIntertrade ? fmt(plan.intertrade_score) : escapeHtml(plan.trend_label || getTrendLabel(plan))}</strong></div>
+        <div><span>${isIntertrade ? "Breakout" : "Momentum"}</span><strong>${isIntertrade ? fmt(plan.breakout_score) : fmt(plan.momentum_score)}</strong></div>
+        <div><span>${isIntertrade ? "Continuation" : "Shares"}</span><strong>${isIntertrade ? fmt(plan.continuation_score) : (plan.suggested_shares || 0)}</strong></div>
+        <div><span>${isIntertrade ? "Volume" : "RR1 / RR2"}</span><strong>${isIntertrade ? fmt(plan.volume_score) : `${fmt(plan.reward_risk_target1)} / ${fmt(plan.reward_risk_target2)}`}</strong></div>
       </div>
+      ${isIntertrade ? `
+        <div class="score-row">
+          <div><span>Entry timing</span><strong>${fmt(plan.entry_timing_score)}</strong></div>
+          <div><span>Risk / reward</span><strong>${fmt(plan.risk_reward_score)}</strong></div>
+          <div><span>Shares</span><strong>${plan.suggested_shares || 0}</strong></div>
+          <div><span>RR1 / RR2</span><strong>${fmt(plan.reward_risk_target1)} / ${fmt(plan.reward_risk_target2)}</strong></div>
+        </div>
+      ` : ""}
       <p class="summary-text">${escapeHtml(plan.momentum_reason || plan.execution_summary || plan.summary || "")}</p>
       <div class="next-step-note">
         <strong>What to do:</strong>
