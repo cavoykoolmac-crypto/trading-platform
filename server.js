@@ -3,6 +3,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { URL } from "node:url";
+import { enrichCandidatesWithIndicators, buildSignalPromptInstructions } from "./signal-engine.js";
+import { shouldITakeThis, getExitAdvice, getMorningBriefing, injectNewsIntoCandidate, gradeTrade } from "./brain-upgrade.js";
 
 await loadDotEnv();
 
@@ -63,12 +65,26 @@ const SWING_UNIVERSE = [
   "NKE", "F", "GM", "RIVN", "LCID", "COIN", "HOOD", "PLTR", "BABA", "PDD"
 ];
 const FUTURES_PROXY_UNIVERSE = [
-  "SPX", "SPY", "QQQ", "IWM", "DIA", "RSP", "MDY", "EFA", "EEM", "FXI", "EWJ",
-  "SMH", "SOXX", "XLK", "XLC", "XLY", "XLP", "XLF", "XLE", "XLV", "XLI",
-  "XLB", "XLU", "XLRE", "KRE", "XBI", "IYT", "GLD", "SLV", "USO", "UNG",
-  "DBA", "TLT", "IEF", "SHY", "HYG", "LQD", "UUP", "FXE", "FXY", "FXB",
-  "XOM", "CVX", "OXY", "COP", "FCX", "NEM", "JPM", "GS", "AAPL", "MSFT",
-  "NVDA", "AMD", "TSLA", "AMZN", "META", "GOOGL"
+  "ES=F",
+  "NQ=F",
+  "RTY=F",
+  "YM=F",
+  "CL=F",
+  "GC=F",
+  "SI=F",
+  "NG=F",
+  "ZB=F",
+  "ZN=F",
+  "6E=F",
+  "6J=F",
+  "6B=F",
+  "HG=F",
+  "ZC=F",
+  "ZS=F",
+  "ZW=F",
+  "BTC=F",
+  "MES=F",
+  "MNQ=F"
 ];
 const BITCOIN_LINKED_UNIVERSE = [
   "MSTR", "COIN", "GLXY", "SQ", "HOOD", "PYPL",
@@ -170,11 +186,11 @@ const SCAN_MODES = {
     promptFocus: "1 to 5 business day swing trade setup, with a 1 to 7 calendar day maximum hold window, entry zone, invalidation, targets, and patience around pullback risk"
   },
   futures: {
-    label: "Futures Bull-Run Proxy",
+    label: "Futures Contracts",
     universe: FUTURES_PROXY_UNIVERSE,
-    assetClass: "futures_proxy",
+    assetClass: "futures",
     holdWindow: "intraday to 2 days",
-    promptFocus: "futures-style bull-run detection using liquid ETF/proxy instruments, early momentum expansion, breakout continuation, clear buy trigger, sell trigger, and fast invalidation"
+    promptFocus: "real futures contract momentum - ES (S&P 500), NQ (Nasdaq), CL (Crude Oil), GC (Gold), RTY (Russell), ZB (Bonds), 6E (Euro FX). Analyze directional momentum, trend strength, and volatility. Entry should be a price level with clear stop and target. Note the contract name and what it tracks in the reason field. Treat each contract as a standalone directional instrument, not an equity."
   },
   bitcoin: {
     label: "Bitcoin-Linked Movers",
@@ -391,6 +407,25 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/ai/chat") {
       const rawBody = await readBody(req);
       return sendJson(res, 200, await tradingAssistantChat(parsePayload(rawBody)));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/ai/trade-check") {
+      const rawBody = await readBody(req);
+      return sendJson(res, 200, await shouldITakeThis(parsePayload(rawBody), state, OPENAI_API_KEY, FINNHUB_API_KEY));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/ai/exit-check") {
+      const rawBody = await readBody(req);
+      return sendJson(res, 200, await getExitAdvice(parsePayload(rawBody), state, OPENAI_API_KEY));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/ai/morning-briefing") {
+      return sendJson(res, 200, await getMorningBriefing(state, OPENAI_API_KEY, FINNHUB_API_KEY));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/ai/grade-trade") {
+      const rawBody = await readBody(req);
+      return sendJson(res, 200, await gradeTrade(parsePayload(rawBody), state, OPENAI_API_KEY));
     }
 
     if (req.method === "GET" && url.pathname === "/api/dashboard/signals") {
@@ -1005,7 +1040,7 @@ async function runMarketScan(request) {
   const createdAt = new Date().toISOString();
   const symbols = request.symbols;
 
-  if (!configuredFinnhub) {
+  if (!configuredFinnhub && request.mode !== "futures") {
     return {
       ok: false,
       createdAt,
@@ -1031,7 +1066,10 @@ async function runMarketScan(request) {
     };
   }
 
-  const quotes = await fetchFinnhubQuotesBatched(symbols);
+  const isFuturesMode = request.mode === "futures";
+  const quotes = isFuturesMode
+    ? await fetchFuturesQuotesBatched(symbols)
+    : await fetchFinnhubQuotesBatched(symbols);
   advanceRotatingBatch(request);
   updateMarketMap(quotes, createdAt, request);
   state.marketRegime = calculateMarketRegime();
@@ -1079,8 +1117,10 @@ async function runMarketScan(request) {
   }
 
   try {
-    const strictSignals = await analyzeScanWithOpenAI(rankedCandidates, request);
-    const momentumSignals = buildMomentumSignals(rankedCandidates, strictSignals, request);
+    const enrichedCandidates = await enrichCandidatesWithIndicators(rankedCandidates, FINNHUB_API_KEY);
+    scan.rankedCandidates = enrichedCandidates;
+    const strictSignals = await analyzeScanWithOpenAI(enrichedCandidates, request);
+    const momentumSignals = buildMomentumSignals(enrichedCandidates, strictSignals, request);
     scan.signals = annotateSignalChanges(mergeSignalsByVariant([...strictSignals, ...momentumSignals]), request);
     await updateSignalLifecycles(scan.signals);
     await deliverEligibleAlerts(scan.signals);
@@ -1117,6 +1157,134 @@ function getLatestScan() {
       ageSeconds: Math.round((Date.now() - latest.cachedAt) / 1000)
     }
   };
+}
+
+async function fetchFuturesQuotesBatched(symbols) {
+  const results = [];
+  for (let i = 0; i < symbols.length; i += 4) {
+    const batch = symbols.slice(i, i + 4);
+    const batchResults = await Promise.all(batch.map(fetchFuturesQuoteYahoo));
+    results.push(...batchResults);
+    if (i + 4 < symbols.length) await sleep(200);
+  }
+  return results.filter(Boolean);
+}
+
+function normalizeYahooVolumes(volumes = []) {
+  if (!volumes.length) return volumes;
+
+  const cleaned = volumes.map((v) => (v == null || !Number.isFinite(Number(v)) ? 0 : Number(v)));
+  const nonZero = cleaned.filter((v) => v > 0);
+  if (!nonZero.length) return cleaned;
+
+  const refAvg = nonZero.reduce((a, b) => a + b, 0) / nonZero.length;
+  return cleaned.map((v) => (v === 0 ? Math.round(refAvg * 0.1) : v));
+}
+
+function isQuoteFresh(timestampSeconds, maxAgeMinutes = 30) {
+  if (!timestampSeconds || !Number.isFinite(Number(timestampSeconds))) return false;
+  const ageMs = Date.now() - Number(timestampSeconds) * 1000;
+  return ageMs <= maxAgeMinutes * 60 * 1000;
+}
+
+async function fetchFuturesQuoteYahoo(symbol) {
+  const FUTURES_LABELS = {
+    "ES=F": "S&P 500 E-mini",
+    "NQ=F": "Nasdaq 100 E-mini",
+    "RTY=F": "Russell 2000 E-mini",
+    "YM=F": "Dow Jones E-mini",
+    "CL=F": "Crude Oil WTI",
+    "GC=F": "Gold",
+    "SI=F": "Silver",
+    "NG=F": "Natural Gas",
+    "ZB=F": "30-Year T-Bond",
+    "ZN=F": "10-Year T-Note",
+    "6E=F": "Euro FX",
+    "6J=F": "Japanese Yen",
+    "6B=F": "British Pound",
+    "HG=F": "Copper",
+    "ZC=F": "Corn",
+    "ZS=F": "Soybeans",
+    "ZW=F": "Wheat",
+    "BTC=F": "Bitcoin CME",
+    "MES=F": "Micro E-mini S&P",
+    "MNQ=F": "Micro E-mini Nasdaq"
+  };
+
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=2d&includePrePost=true`;
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; trading-scanner/1.0)",
+        Accept: "application/json"
+      }
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const result = data?.chart?.result?.[0];
+    const meta = result?.meta;
+    const q = result?.indicators?.quote?.[0];
+    const ts = result?.timestamp || [];
+
+    if (!meta || !q || !ts.length) return null;
+
+    const closes = [];
+    const highs = [];
+    const lows = [];
+    const opens = [];
+    const volumes = [];
+    for (let i = 0; i < ts.length; i += 1) {
+      if (q.close?.[i] == null) continue;
+      closes.push(q.close[i]);
+      highs.push(q.high?.[i] ?? q.close[i]);
+      lows.push(q.low?.[i] ?? q.close[i]);
+      opens.push(q.open?.[i] ?? q.close[i]);
+      volumes.push(q.volume?.[i] ?? 0);
+    }
+
+    if (closes.length < 2) return null;
+    const normalizedVolumes = normalizeYahooVolumes(volumes);
+
+    const current = closes[closes.length - 1];
+    const open = opens[0];
+    const high = Math.max(...highs);
+    const low = Math.min(...lows);
+    const previousClose = meta.chartPreviousClose || meta.previousClose || open;
+    const changePercent = previousClose > 0
+      ? ((current - previousClose) / previousClose) * 100
+      : 0;
+
+    const volSlice = normalizedVolumes.slice(-21, -1).filter((v) => v > 0);
+    const avgVolume = volSlice.length
+      ? volSlice.reduce((a, b) => a + b, 0) / volSlice.length
+      : 0;
+    const currentVolume = normalizedVolumes[normalizedVolumes.length - 1] || 0;
+    const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 1;
+    const lastTs = ts[ts.length - 1];
+    if (!isQuoteFresh(lastTs, 45)) {
+      return null;
+    }
+
+    return {
+      ok: true,
+      symbol,
+      label: FUTURES_LABELS[symbol] || symbol,
+      current,
+      open,
+      high,
+      low,
+      previousClose,
+      volume: currentVolume,
+      avgVolume: Math.round(avgVolume),
+      volumeRatio: Number(volumeRatio.toFixed(2)),
+      changePercent: Number(changePercent.toFixed(3)),
+      candle_count: closes.length,
+      source: "yahoo_futures",
+      assetClass: "futures"
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function fetchFinnhubQuotesBatched(symbols) {
@@ -1156,7 +1324,7 @@ async function getTickerQuote(symbol, refresh = false) {
     };
   }
 
-  if (!CRYPTO_SYMBOLS[ticker] && !isConfiguredKey(FINNHUB_API_KEY, "your_finnhub_key_here")) {
+  if (!CRYPTO_SYMBOLS[ticker] && !FUTURES_PROXY_UNIVERSE.includes(ticker) && !isConfiguredKey(FINNHUB_API_KEY, "your_finnhub_key_here")) {
     return {
       ok: false,
       symbol: ticker,
@@ -1182,6 +1350,9 @@ async function getTickerQuote(symbol, refresh = false) {
 
 async function fetchFinnhubQuote(symbol) {
   const normalizedSymbol = normalizeMarketTicker(symbol);
+  if (FUTURES_PROXY_UNIVERSE.includes(normalizedSymbol)) {
+    return fetchFuturesQuoteYahoo(normalizedSymbol);
+  }
   if (CRYPTO_SYMBOLS[normalizedSymbol]) {
     return fetchCryptoQuote(normalizedSymbol);
   }
@@ -1264,48 +1435,137 @@ async function fetchFinnhubEquityQuote(providerSymbol, displaySymbol = providerS
 
 async function fetchCryptoQuote(symbol) {
   const config = CRYPTO_SYMBOLS[symbol];
-  const endpoint = new URL("https://api.binance.us/api/v3/ticker/24hr");
-  endpoint.searchParams.set("symbol", config.pair);
+  if (!config?.pair) {
+    return {
+      ...addSessionPriceFields({
+        ok: false,
+        symbol,
+        error: `No crypto pair config for ${symbol}.`
+      })
+    };
+  }
+
+  const binanceUrls = [
+    `https://api.binance.com/api/v3/ticker/24hr?symbol=${config.pair}`,
+    `https://api1.binance.com/api/v3/ticker/24hr?symbol=${config.pair}`
+  ];
+
+  for (const url of binanceUrls) {
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: "application/json" }
+      });
+      const data = await response.json();
+      if (!response.ok || !data?.lastPrice) {
+        throw new Error(data?.msg || `Crypto quote request failed with ${response.status}`);
+      }
+
+      const current = Number(data.lastPrice);
+      const open = Number(data.openPrice);
+      const high = Number(data.highPrice);
+      const low = Number(data.lowPrice);
+      const volume = Number(data.volume);
+      const changePercent = open > 0 ? ((current - open) / open) * 100 : 0;
+
+      return {
+        ...addSessionPriceFields({
+          ok: true,
+          symbol,
+          displayName: config.label,
+          source: "binance",
+          cryptoPair: config.pair,
+          current,
+          change: current - open,
+          changePercent: Number(changePercent.toFixed(3)),
+          high,
+          low,
+          open,
+          volume,
+          previousClose: open,
+          timestamp: new Date().toISOString()
+        })
+      };
+    } catch {
+      // Try the next source.
+    }
+  }
 
   try {
-    const response = await fetch(endpoint);
+    const yahooSymbol = `${symbol.replace(/USD$/, "")}-USD`;
+    const endpoint = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`);
+    endpoint.searchParams.set("interval", "5m");
+    endpoint.searchParams.set("range", "2d");
+    endpoint.searchParams.set("includePrePost", "false");
+    const response = await fetch(endpoint, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/json"
+      }
+    });
     const data = await response.json();
+    const result = data?.chart?.result?.[0];
+    const quote = result?.meta || null;
+    const series = result?.indicators?.quote?.[0] || null;
+    const ts = result?.timestamp || [];
 
-    if (!response.ok) {
-      throw new Error(data?.msg || `Crypto quote request failed with ${response.status}`);
+    if (!response.ok || !quote || !series) {
+      throw new Error(data?.chart?.error?.description || `Yahoo crypto quote failed with ${response.status}`);
     }
 
-    const current = Number(data.lastPrice);
-    const open = Number(data.openPrice);
-    const high = Number(data.highPrice);
-    const low = Number(data.lowPrice);
-    const change = Number(data.priceChange);
-    const changePercent = Number(data.priceChangePercent);
+    const current = Number(quote.regularMarketPrice);
+    const open = Number(quote.chartPreviousClose ?? quote.previousClose ?? current);
+    const high = Number(quote.regularMarketDayHigh ?? current);
+    const low = Number(quote.regularMarketDayLow ?? current);
+    const rawVolumes = Array.isArray(series.volume) ? series.volume.map((value) => Number(value)) : [];
+    const normalizedVolumes = normalizeYahooVolumes(rawVolumes);
+    const volSlice = normalizedVolumes.slice(-21, -1).filter((value) => value > 0);
+    const avgVolume = volSlice.length
+      ? volSlice.reduce((a, b) => a + b, 0) / volSlice.length
+      : 0;
+    const volume = normalizedVolumes.length ? Number(normalizedVolumes.at(-1)) : 0;
+    const volumeRatio = avgVolume > 0 ? volume / avgVolume : 0.1;
+    const changePercent = open > 0 ? ((current - open) / open) * 100 : 0;
+    const lastTimestamp = ts[ts.length - 1];
+    if (!isQuoteFresh(lastTimestamp, 30)) {
+      return {
+        ok: false,
+        symbol,
+        stale: true,
+        stale_age_minutes: lastTimestamp
+          ? Math.round((Date.now() - lastTimestamp * 1000) / 60000)
+          : null,
+        error: `Yahoo quote for ${symbol} is stale (last bar too old). Skipping.`,
+        source: "yahoo_stale"
+      };
+    }
 
     return {
       ...addSessionPriceFields({
-      ok: true,
-      symbol,
-      displayName: config.label,
-      source: "binance.us",
-      cryptoPair: config.pair,
-      current,
-      change,
-      changePercent,
-      high,
-      low,
-      open,
-      previousClose: open,
-      timestamp: new Date().toISOString()
+        ok: true,
+        symbol,
+        displayName: config.label,
+        source: "yahoo",
+        cryptoPair: config.pair,
+        current,
+        change: current - open,
+        changePercent: Number(changePercent.toFixed(3)),
+        high,
+        low,
+        open,
+        volume,
+        avgVolume: Math.round(avgVolume),
+        volumeRatio: Number(volumeRatio.toFixed(2)),
+        previousClose: open,
+        timestamp: quote.regularMarketTime ? new Date(quote.regularMarketTime * 1000).toISOString() : new Date().toISOString()
       })
     };
   } catch (error) {
     return {
       ...addSessionPriceFields({
-      ok: false,
-      symbol,
-      source: "binance.us",
-      error: error.message || "Crypto quote failed."
+        ok: false,
+        symbol,
+        source: "binance",
+        error: error.message || "Crypto quote failed."
       })
     };
   }
@@ -1357,27 +1617,7 @@ function addSessionPriceFields(quote) {
 
 async function analyzeScanWithOpenAI(rankedQuotes, request) {
   const data = await callOpenAI({
-    instructions: [
-      "You are a trading signal engine reviewing pre-filtered market scanner candidates.",
-      "Be concise, practical, and risk-aware.",
-      "Do not provide personalized financial advice and do not place trades.",
-      "Return strict JSON only. No markdown, no prose outside JSON.",
-      `Scanner mode: ${request.modeConfig.label}. Focus: ${request.modeConfig.promptFocus}.`,
-      `Default hold window: ${request.modeConfig.holdWindow}. Asset class: ${request.modeConfig.assetClass}.`,
-      "Also detect obvious bull runs or strong upward trends even if the setup is not perfect. Prefer clear, visible momentum over perfect but rare setups.",
-      "Prefer clean breakout-continuation names that are green, holding near highs, and still close enough to entry to trade without chasing.",
-      "Return an array of objects with exactly these keys: ticker, bias, entry, stop, target1, target2, confidence, reason, invalid_if, buy_trigger, sell_trigger, bull_run_flag, hold_window, setup_score, momentum_score, trend_label, momentum_reason.",
-      "The ticker value must exactly match the candidate symbol provided. For crypto, use the dashboard symbols like BTCUSD, ETHUSD, SOLUSD, XRPUSD, DOGEUSD, ADAUSD, AVAXUSD, LINKUSD, MATICUSD, LTCUSD, or SHIBUSD, not exchange pair names like BTCUSDT.",
-      "confidence must be a number from 1 to 10.",
-      "setup_score must be a number from 1 to 100.",
-      "momentum_score must be a number from 0 to 100.",
-      "trend_label must be one of: strong uptrend, breakout, continuation, early trend.",
-      "momentum_reason must be short plain English explaining why momentum is visible.",
-      "bull_run_flag must be true only for strong upside momentum or clean continuation setups.",
-      "For bitcoin-linked candidates, use bitcoin_pulse, bitcoin_profile, bitcoin_news_headlines, and bitcoin_activity_links to judge whether the ticker is moving with BTC swings, crypto activity, or news. Miners and leveraged ETFs can move faster than BTC; spot ETFs should track BTC more closely.",
-      "For bitcoin-linked downside momentum, use bearish/watch/skip language with a sell_trigger; do not force bullish signals when BTC pulse is weak or breaking down.",
-      "If a candidate lacks enough context, still return a cautious signal and mention missing context in reason or invalid_if."
-    ].join(" "),
+    instructions: buildSignalPromptInstructions(request).join(" "),
     input: JSON.stringify(rankedQuotes, null, 2),
     maxOutputTokens: 1400,
     errorLabel: "OpenAI scan analysis"
@@ -1543,7 +1783,7 @@ function normalizeMode(mode) {
 }
 
 function normalizeMarketTicker(value) {
-  const raw = String(value || "").toUpperCase().replace(/[^A-Z0-9.]/g, "");
+  const raw = String(value || "").toUpperCase().replace(/[^A-Z0-9.=]/g, "");
   if (!raw) return "";
   const crypto = CRYPTO_SYMBOLS[raw];
   if (crypto?.alias) return crypto.alias;
@@ -1568,6 +1808,7 @@ function updateMarketMap(quotes, scannedAt, request) {
     if (!quote.ok) continue;
     const enriched = {
       ...quote,
+      volumeRatio: Number(quote.volumeRatio || quote.volume_ratio || 0),
       mode: request.mode,
       asset_class: request.modeConfig.assetClass,
       hold_window: request.modeConfig.holdWindow,
@@ -2906,8 +3147,10 @@ function rankScanCandidates(quotes, mode = "intraday") {
   return quotes
     .filter((quote) => {
       if (!quote.ok) return false;
+      if (quote.stale) return false;
       if (!Number.isFinite(Number(quote.current))) return false;
-      if (!cryptoMode && Number(quote.current) < 5) return false;
+      const futuresModeRank = mode === "futures";
+      if (!cryptoMode && !futuresModeRank && Number(quote.current) < 5) return false;
       if (!Number.isFinite(Number(quote.changePercent))) return false;
       if (!cryptoMode && !bitcoinMode && Number(quote.changePercent) <= 0) return false;
       return true;
@@ -2947,6 +3190,10 @@ async function enrichRankedCandidatesForMode(candidates, request) {
     ...candidate,
     momentum_context: momentumMap.get(candidate.symbol) || null
   }));
+
+  for (const candidate of enrichedCandidates) {
+    await injectNewsIntoCandidate(candidate, FINNHUB_API_KEY);
+  }
 
   const hasBitcoinLinked = enrichedCandidates.some((candidate) => {
     const ticker = candidate.symbol;
@@ -3009,7 +3256,9 @@ async function getMomentumContextForCandidate(candidate, mode) {
     const normalized = normalizeMarketTicker(candidate.symbol);
     const candles = CRYPTO_SYMBOLS[normalized]
       ? await fetchCryptoCandles(normalized, mode)
-      : await fetchFinnhubCandles(normalized, mode);
+      : FUTURES_PROXY_UNIVERSE.includes(normalized)
+        ? await fetchFuturesCandlesYahoo(normalized, mode)
+        : await fetchFinnhubCandles(normalized, mode);
     const candleContext = analyzeMomentumCandles(candles, normalized);
     if (candleContext?.ok) return candleContext;
   } catch {
@@ -3023,7 +3272,9 @@ async function getMomentumContext(symbol, mode) {
     const normalized = normalizeMarketTicker(symbol);
     const candles = CRYPTO_SYMBOLS[normalized]
       ? await fetchCryptoCandles(normalized, mode)
-      : await fetchFinnhubCandles(normalized, mode);
+      : FUTURES_PROXY_UNIVERSE.includes(normalized)
+        ? await fetchFuturesCandlesYahoo(normalized, mode)
+        : await fetchFinnhubCandles(normalized, mode);
     return analyzeMomentumCandles(candles, normalized);
   } catch (error) {
     return {
@@ -3122,25 +3373,110 @@ async function fetchFinnhubCandles(symbol, mode) {
   })).filter((row) => Number.isFinite(row.close));
 }
 
+async function fetchFuturesCandlesYahoo(symbol, mode) {
+  const interval = mode === "swing" ? "1h" : "15m";
+  const range = mode === "swing" ? "5d" : "2d";
+  const endpoint = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+  endpoint.searchParams.set("interval", interval);
+  endpoint.searchParams.set("range", range);
+  endpoint.searchParams.set("includePrePost", "true");
+  const response = await fetch(endpoint, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; trading-scanner/1.0)",
+      Accept: "application/json"
+    }
+  });
+  const data = await response.json();
+  const result = data?.chart?.result?.[0];
+  const quote = result?.indicators?.quote?.[0];
+  const timestamps = result?.timestamp || [];
+  if (!response.ok || !quote || !timestamps.length) {
+    throw new Error(data?.chart?.error?.description || `Yahoo futures candle request failed for ${symbol}.`);
+  }
+
+  return timestamps.map((timestamp, index) => ({
+    close: Number(quote.close?.[index]),
+    open: Number(quote.open?.[index]),
+    high: Number(quote.high?.[index]),
+    low: Number(quote.low?.[index]),
+    volume: Number(quote.volume?.[index] || 0),
+    timestamp: Number(timestamp || 0) * 1000
+  })).filter((row) => Number.isFinite(row.close));
+}
+
 async function fetchCryptoCandles(symbol, mode) {
   const config = CRYPTO_SYMBOLS[symbol];
+  if (!config?.pair) throw new Error(`No pair config for ${symbol}`);
   const interval = getMomentumResolution(mode, true);
-  const endpoint = new URL("https://api.binance.us/api/v3/klines");
-  endpoint.searchParams.set("symbol", config.pair);
-  endpoint.searchParams.set("interval", interval);
-  endpoint.searchParams.set("limit", String(MOMENTUM_CANDLE_LIMIT + 5));
-  const response = await fetch(endpoint);
-  const data = await response.json();
-  if (!response.ok || !Array.isArray(data)) {
-    throw new Error(data?.msg || `Crypto candle request failed for ${symbol}.`);
+
+  const sources = [
+    `https://api.binance.com/api/v3/klines?symbol=${config.pair}&interval=${interval}&limit=${MOMENTUM_CANDLE_LIMIT + 5}`,
+    `https://api1.binance.com/api/v3/klines?symbol=${config.pair}&interval=${interval}&limit=${MOMENTUM_CANDLE_LIMIT + 5}`
+  ];
+
+  let data = null;
+  for (const url of sources) {
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: "application/json" }
+      });
+      const json = await response.json();
+      if (response.ok && Array.isArray(json) && json.length > 0) {
+        data = json;
+        break;
+      }
+    } catch {
+      // Try the next source.
+    }
   }
+
+  if (!data) {
+    try {
+      const yahooSymbol = `${symbol.replace(/USD$/, "")}-USD`;
+      const yahooInterval = interval === "1h" ? "1h" : interval === "4h" ? "1h" : "15m";
+      const yahooRange = interval === "4h" ? "5d" : "2d";
+      const endpoint = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`);
+      endpoint.searchParams.set("interval", yahooInterval);
+      endpoint.searchParams.set("range", yahooRange);
+      endpoint.searchParams.set("includePrePost", "false");
+      const response = await fetch(endpoint, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          Accept: "application/json"
+        }
+      });
+      const json = await response.json();
+      const result = json?.chart?.result?.[0];
+      const quote = result?.indicators?.quote?.[0];
+      const timestamps = result?.timestamp || [];
+      if (quote && timestamps.length > 0) {
+        data = timestamps
+          .map((timestamp, index) => [
+            timestamp * 1000,
+            quote.open?.[index],
+            quote.high?.[index],
+            quote.low?.[index],
+            quote.close?.[index],
+            quote.volume?.[index]
+          ])
+          .filter((row) => row[4] != null);
+      }
+    } catch {
+      // Fall through to the final error.
+    }
+  }
+
+  if (!data || !data.length) {
+    throw new Error(`All crypto candle sources failed for ${symbol}`);
+  }
+
   return data.map((row) => ({
     timestamp: Number(row[0] || 0),
     open: Number(row[1]),
     high: Number(row[2]),
     low: Number(row[3]),
     close: Number(row[4]),
-    volume: Number(row[5])
+    volume: Number(row[5] || 0)
   })).filter((row) => Number.isFinite(row.close));
 }
 
@@ -3298,7 +3634,7 @@ async function getBitcoinPulseContext(refresh = false) {
     ibit_change_pct: Number.isFinite(Number(ibit?.changePercent)) ? Number(Number(ibit.changePercent).toFixed(3)) : null,
     mstr_change_pct: Number.isFinite(Number(mstr?.changePercent)) ? Number(Number(mstr.changePercent).toFixed(3)) : null,
     coin_change_pct: Number.isFinite(Number(coin?.changePercent)) ? Number(Number(coin.changePercent).toFixed(3)) : null,
-    source: btcQuote?.source || "binance.us",
+    source: btcQuote?.source || "binance",
     updatedAt: new Date().toISOString()
   };
 }
@@ -3714,6 +4050,7 @@ function createIntertradeSignal(candidate, strictSignal, request) {
 }
 
 function inferSourceMode(ticker) {
+  if (isFuturesContract(ticker)) return "futures";
   if (CRYPTO_UNIVERSE.includes(normalizeMarketTicker(ticker)) || CRYPTO_SYMBOLS[normalizeMarketTicker(ticker)]) return "crypto";
   if (INDEX_SYMBOLS[ticker]) return "futures";
   if (BITCOIN_LINKED_UNIVERSE.includes(ticker)) return "bitcoin";
@@ -3723,10 +4060,11 @@ function inferSourceMode(ticker) {
 }
 
 function inferAssetClass(ticker) {
+  if (isFuturesContract(ticker)) return "futures";
   if (CRYPTO_UNIVERSE.includes(normalizeMarketTicker(ticker)) || CRYPTO_SYMBOLS[normalizeMarketTicker(ticker)]) return "crypto";
   if (INDEX_SYMBOLS[ticker]) return "index";
   if (BITCOIN_LINKED_UNIVERSE.includes(ticker)) return "bitcoin_linked";
-  return FUTURES_PROXY_UNIVERSE.includes(ticker) ? "futures_proxy" : "equity";
+  return FUTURES_PROXY_UNIVERSE.includes(ticker) ? "futures" : "equity";
 }
 
 function annotateSignalChanges(signals, request) {
@@ -3876,6 +4214,147 @@ function addQualityScores(signal) {
   };
 }
 
+const FUTURES_CONTRACT_SPECS = {
+  "ES=F": { name: "E-mini S&P 500", multiplier: 50, tickSize: 0.25, margin: 12000 },
+  "MES=F": { name: "Micro E-mini S&P", multiplier: 5, tickSize: 0.25, margin: 1200 },
+  "NQ=F": { name: "E-mini Nasdaq", multiplier: 20, tickSize: 0.25, margin: 16500 },
+  "MNQ=F": { name: "Micro E-mini Nasdaq", multiplier: 2, tickSize: 0.25, margin: 1650 },
+  "RTY=F": { name: "E-mini Russell", multiplier: 50, tickSize: 0.1, margin: 7000 },
+  "YM=F": { name: "E-mini Dow", multiplier: 5, tickSize: 1, margin: 9000 },
+  "CL=F": { name: "Crude Oil WTI", multiplier: 1000, tickSize: 0.01, margin: 6000 },
+  "GC=F": { name: "Gold", multiplier: 100, tickSize: 0.1, margin: 9000 },
+  "SI=F": { name: "Silver", multiplier: 5000, tickSize: 0.005, margin: 7000 },
+  "NG=F": { name: "Natural Gas", multiplier: 10000, tickSize: 0.001, margin: 3500 },
+  "ZB=F": { name: "30-Year T-Bond", multiplier: 1000, tickSize: 0.03125, margin: 3200 },
+  "ZN=F": { name: "10-Year T-Note", multiplier: 1000, tickSize: 0.015625, margin: 1600 },
+  "6E=F": { name: "Euro FX", multiplier: 125000, tickSize: 0.00005, margin: 2600 },
+  "6J=F": { name: "Japanese Yen", multiplier: 12500000, tickSize: 0.0000005, margin: 2700 },
+  "6B=F": { name: "British Pound", multiplier: 62500, tickSize: 0.0001, margin: 2600 },
+  "HG=F": { name: "Copper", multiplier: 25000, tickSize: 0.0005, margin: 4000 },
+  "ZC=F": { name: "Corn", multiplier: 50, tickSize: 0.25, margin: 1200 },
+  "ZS=F": { name: "Soybeans", multiplier: 50, tickSize: 0.25, margin: 2200 },
+  "ZW=F": { name: "Wheat", multiplier: 50, tickSize: 0.25, margin: 1800 },
+  "BTC=F": { name: "Bitcoin CME", multiplier: 5, tickSize: 5, margin: 60000 }
+};
+
+function isFuturesContract(ticker) {
+  return String(ticker || "").endsWith("=F");
+}
+
+function buildFuturesExecutionPlan(signal, settings) {
+  const ticker = String(signal.ticker || "");
+  const spec = FUTURES_CONTRACT_SPECS[ticker];
+  const entry = parseFirstNumber(signal.entry || signal.buy_trigger);
+  const stop = parseFirstNumber(signal.stop || signal.sell_trigger);
+  const target1 = parseFirstNumber(signal.target1);
+  const target2 = parseFirstNumber(signal.target2);
+  const current = Number(signal.price);
+  const bearish = ["bearish", "short", "sell"].includes(String(signal.bias || "").toLowerCase());
+  const quality = Number(signal.final_quality_score || 0);
+  const confidence = Number(signal.confidence || 0);
+
+  if (!Number.isFinite(entry) || !Number.isFinite(stop)) {
+    return {
+      signal_id: signal.signal_id,
+      ticker,
+      mode: signal.signal_mode || signal.mode,
+      bias: signal.bias,
+      action: "skip",
+      skip_reasons: ["no numeric entry or stop for futures contract"],
+      suggested_shares: 0,
+      suggested_contracts: 0,
+      estimated_position_dollars: 0,
+      estimated_risk_dollars: 0,
+      reward_risk_target1: null,
+      reward_risk_target2: null,
+      final_quality_score: quality,
+      confidence,
+      final_decision: signal.final_decision || "skip",
+      asset_class: "futures",
+      contract_spec: spec || null,
+      summary: `${ticker} | SKIP | no numeric entry or stop`
+    };
+  }
+
+  const riskPerPoint = Math.abs(entry - stop);
+  const multiplier = spec?.multiplier || 1;
+  const riskPerContract = riskPerPoint * multiplier;
+  const marginRequired = spec?.margin || Math.abs(entry) * 0.05;
+  const contractsByRisk = riskPerContract > 0
+    ? Math.floor(settings.max_risk_dollars / riskPerContract)
+    : 0;
+  const contractsByMargin = marginRequired > 0
+    ? Math.floor(settings.account_size * (settings.max_position_pct / 100) / marginRequired)
+    : 0;
+  const suggestedContracts = Math.max(0, Math.min(contractsByRisk, contractsByMargin, 5));
+
+  const estimatedRiskDollars = Number((suggestedContracts * riskPerContract).toFixed(2));
+  const notionalValue = entry * multiplier * suggestedContracts;
+  const reward1 = Number.isFinite(target1) ? Math.abs(target1 - entry) * multiplier * suggestedContracts : NaN;
+  const reward2 = Number.isFinite(target2) ? Math.abs(target2 - entry) * multiplier * suggestedContracts : NaN;
+  const rr1 = estimatedRiskDollars > 0 && Number.isFinite(reward1) ? Number((reward1 / estimatedRiskDollars).toFixed(2)) : null;
+  const rr2 = estimatedRiskDollars > 0 && Number.isFinite(reward2) ? Number((reward2 / estimatedRiskDollars).toFixed(2)) : null;
+  const entryDistancePct = Number.isFinite(current) && current > 0
+    ? Math.abs(entry - current) / current * 100
+    : 0;
+
+  const skipReasons = [];
+  if (confidence < 5) skipReasons.push("low confidence");
+  if (quality < 50) skipReasons.push("poor setup quality");
+  if (suggestedContracts <= 0) skipReasons.push("account too small for even 1 contract - consider Micro contracts");
+  if (rr1 !== null && rr1 < 1) skipReasons.push("reward/risk below 1:1");
+  if (signal.expired_flag) skipReasons.push("expired signal");
+  if (entryDistancePct > 2) skipReasons.push("entry too far from current price (>2%)");
+
+  const action = skipReasons.length ? "skip"
+    : quality >= 65 && confidence >= 6 && rr1 !== null && rr1 >= 1 ? "take_candidate"
+    : "watch";
+
+  const side = bearish ? "SELL SHORT" : "BUY";
+  const summary = skipReasons.length
+    ? `${ticker} | SKIP | ${skipReasons.join("; ")}`
+    : `${ticker} | FUTURES | ${side} ${suggestedContracts} contract${suggestedContracts !== 1 ? "s" : ""} @ ${formatNumber(entry)} | STOP ${formatNumber(stop)} | RISK $${estimatedRiskDollars} | RR1 ${rr1 ?? "n/a"} | MARGIN ~$${Math.round(marginRequired * suggestedContracts).toLocaleString()}`;
+
+  return {
+    signal_id: signal.signal_id,
+    ticker,
+    mode: signal.signal_mode || signal.mode,
+    bias: signal.bias,
+    action,
+    skip_reasons: skipReasons,
+    account_size: settings.account_size,
+    risk_pct: settings.risk_pct,
+    max_risk_dollars: settings.max_risk_dollars,
+    entry: entry,
+    stop: stop,
+    target1: Number.isFinite(target1) ? target1 : null,
+    target2: Number.isFinite(target2) ? target2 : null,
+    current_price: Number.isFinite(current) ? current : null,
+    risk_per_point: Number(riskPerPoint.toFixed(4)),
+    risk_per_contract: Number(riskPerContract.toFixed(2)),
+    suggested_shares: suggestedContracts,
+    suggested_contracts: suggestedContracts,
+    estimated_position_dollars: Number(notionalValue.toFixed(2)),
+    estimated_risk_dollars: estimatedRiskDollars,
+    margin_per_contract: marginRequired,
+    total_margin_required: Math.round(marginRequired * suggestedContracts),
+    reward_risk_target1: rr1,
+    reward_risk_target2: rr2,
+    final_quality_score: quality,
+    confidence,
+    final_decision: signal.final_decision || action,
+    buy_now_type: action === "take_candidate" ? "take" : null,
+    asset_class: "futures",
+    contract_spec: spec || { multiplier: 1, tickSize: null, margin: null },
+    contract_name: spec?.name || ticker,
+    entry_distance_pct: Number(entryDistancePct.toFixed(3)),
+    momentum_score: Number(signal.momentum_score || 0),
+    trend_label: signal.trend_label || "",
+    momentum_reason: signal.momentum_reason || "",
+    summary
+  };
+}
+
 function getExecutionSettings() {
   const accountSize = Number.isFinite(EXECUTION_ACCOUNT_SIZE) && EXECUTION_ACCOUNT_SIZE > 0 ? EXECUTION_ACCOUNT_SIZE : 10000;
   const riskPct = Number.isFinite(EXECUTION_RISK_PCT) && EXECUTION_RISK_PCT > 0 ? EXECUTION_RISK_PCT : 0.5;
@@ -3891,6 +4370,10 @@ function getExecutionSettings() {
 }
 
 function buildExecutionPlan(signal) {
+  if (isFuturesContract(signal.ticker)) {
+    return buildFuturesExecutionPlan(signal, getExecutionSettings());
+  }
+
   const settings = getExecutionSettings();
   const current = Number(signal.price);
   const entry = parseFirstNumber(signal.entry || signal.buy_trigger);
@@ -4023,6 +4506,32 @@ function formatExecutionSummary(signal, plan, decision) {
 }
 
 function getFinalDecision(signal, executionPlan) {
+  if (isFuturesContract(signal.ticker)) {
+    const quality = Number(signal.final_quality_score || 0);
+    const confidence = Number(signal.confidence || 0);
+    const futuresSkip = [];
+    if (signal.expired_flag) futuresSkip.push("expired signal");
+    if (signal.signal_stale_flag) futuresSkip.push("stale signal");
+    if (confidence < 5) futuresSkip.push("low confidence");
+    if (quality < 45) futuresSkip.push("poor setup quality");
+    if (executionPlan.suggested_contracts <= 0) futuresSkip.push("account too small - use Micro contracts");
+
+    if (futuresSkip.length) {
+      return { final_decision: "skip", skip_trade_flag: true, decision_reasons: futuresSkip };
+    }
+
+    const futuresRR = Number(executionPlan.reward_risk_target1);
+    if (quality >= 55 && confidence >= 6 && Number.isFinite(futuresRR) && futuresRR >= 1) {
+      return { final_decision: "take", skip_trade_flag: false, decision_reasons: ["futures: quality/confidence/RR aligned"] };
+    }
+
+    return {
+      final_decision: "watch",
+      skip_trade_flag: false,
+      decision_reasons: ["futures: waiting for stronger setup or entry proximity"]
+    };
+  }
+
   const quality = Number(signal.final_quality_score || 0);
   const confidence = Number(signal.confidence || 0);
   const rr1 = Number(executionPlan.reward_risk_target1);
@@ -4148,13 +4657,23 @@ function getDecisionSkipReasons(signal, executionPlan) {
   if (executionPlan.suggested_shares <= 0) reasons.push("position size is zero");
   if (Number.isFinite(rr1) && rr1 < 1 && (!Number.isFinite(rr2) || rr2 < 1.25)) reasons.push("bad reward/risk");
   if (signal.regime_alignment === "against_regime" && signal.signal_type !== "intertrade_take") reasons.push("against regime");
-  if (!signal.session_open_flag && !["futures_proxy", "bitcoin_linked"].includes(signal.asset_class) && quality < 80) reasons.push("off-session equity signal");
+  if (!signal.session_open_flag && !["futures_proxy", "futures", "bitcoin_linked"].includes(signal.asset_class) && quality < 80) reasons.push("off-session equity signal");
   if (signal.mtf_confirmation === "weak" && quality < 70) reasons.push("weak multi-timeframe proxy");
 
   return [...new Set(reasons)];
 }
 
 function getExecutionSkipReasons({ signal, entry, stop, riskPerShare, suggestedShares, rr1, entryDistancePct, quality, confidence }) {
+  if (isFuturesContract(signal.ticker)) {
+    const futuresReasons = [];
+    if (["neutral", "watch", "hold"].includes(String(signal.bias || "").toLowerCase())) futuresReasons.push("neutral/watch signal");
+    if (quality < 45) futuresReasons.push("quality below 45");
+    if (confidence < 5) futuresReasons.push("confidence below 5");
+    if (!Number.isFinite(entry)) futuresReasons.push("no numeric entry");
+    if (!Number.isFinite(stop)) futuresReasons.push("no numeric stop");
+    return [...new Set(futuresReasons)];
+  }
+
   const reasons = [];
   const neutralBias = ["neutral", "watch", "hold"].includes(String(signal.bias || "").toLowerCase());
 
@@ -4359,6 +4878,10 @@ function getFinalQualityScore({ signal, regimeAlignment, sectorStrength, entryDi
     entryDistanceScore.score * 0.07 +
     participationScore * 0.03 +
     momentum * 0.12;
+
+  if (signal?.asset_class === "futures" || isFuturesContract(signal?.ticker || "")) {
+    return Math.round(Math.max(1, Math.min(100, score * 1.15)));
+  }
 
   return Math.round(Math.max(1, Math.min(100, score)));
 }
@@ -5284,8 +5807,9 @@ function renderTradingPlatform() {
       <p class="chart-note">Chart data is provided by TradingView. Use the signal plan first, then verify price action before opening Webull.</p>
     </div>
   </div>
-  <script src="/public/dashboard.js" type="module"></script>
-</body>
+    <script src="/public/dashboard.js" type="module"></script>
+    <script src="/public/brain-ui.js"></script>
+  </body>
 </html>`;
 }
 
