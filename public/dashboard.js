@@ -23,11 +23,14 @@ const state = {
   chart: {
     ticker: "",
     mode: "",
-    interval: "15"
+    interval: "15",
+    showSignals: localStorage.getItem("chart_show_signals") !== "off",
+    refreshTimer: null
   },
   ui: {
     pendingChartTicker: "",
     pendingChartMode: "",
+    executionFocusTicker: "",
     bootRefreshTimer: null,
     bootRefreshAttempts: 0,
     emptyAutoScanAt: {},
@@ -40,6 +43,8 @@ const state = {
 const INACTIVITY_LIMIT_MS = 5 * 60 * 1000;
 const BOOT_REFRESH_INTERVAL_MS = 2500;
 const BOOT_REFRESH_MAX_ATTEMPTS = 12;
+const PRO_WARMUP_CRYPTO_DELAY_MS = 8000;
+const PRO_WARMUP_MOMENTUM_DELAY_MS = 10000;
 
 const views = {
   dashboard: { title: "Home", eyebrow: "Everything In One Place" },
@@ -47,6 +52,7 @@ const views = {
   movers: { title: "Moving Now", eyebrow: "What Is Moving Right Now?" },
   watchlist: { title: "Watchlist", eyebrow: "Good Setups, Not Ready Yet" },
   browser: { title: "Market Browser", eyebrow: "Research Any Ticker" },
+  tradeideas: { title: "Trade Ideas Center", eyebrow: "Scanner Feed" },
   ai: { title: "Signal Brain", eyebrow: "ChatGPT Status" },
   overview: { title: "Trading Dashboard", eyebrow: "Overview" },
   intraday: { title: "Intraday Signals", eyebrow: "Signals" },
@@ -139,6 +145,11 @@ const chartFrame = document.querySelector("#chart-frame");
 const chartTitle = document.querySelector("#chart-title");
 const chartClose = document.querySelector("#chart-close");
 const chartToolbar = document.querySelector("#chart-toolbar");
+const chartSignalToggle = document.querySelector("#chart-signal-toggle");
+const frameworkModal = document.querySelector("#framework-modal");
+const frameworkModalTitle = document.querySelector("#framework-modal-title");
+const frameworkModalContent = document.querySelector("#framework-modal-content");
+const frameworkModalClose = document.querySelector("#framework-modal-close");
 const mobileMenuToggle = document.querySelector("#mobile-menu-toggle");
 const mobileRefreshButton = document.querySelector("#mobile-refresh-now");
 const mobileNavBackdrop = document.querySelector("#mobile-nav-backdrop");
@@ -147,6 +158,12 @@ const mobileMedia = window.matchMedia("(max-width: 767px)");
 document.querySelectorAll("[data-view]").forEach((button) => {
   button.addEventListener("click", () => {
     void navigateToView(button.dataset.view);
+  });
+});
+
+document.querySelectorAll("[data-route]").forEach((button) => {
+  button.addEventListener("click", () => {
+    window.location.href = button.dataset.route || "/";
   });
 });
 
@@ -163,11 +180,22 @@ chartToolbar?.addEventListener("click", (event) => {
   chartToolbar.querySelectorAll("[data-chart-interval]").forEach((item) => item.classList.toggle("active", item === button));
   void openChart(state.chart.ticker, state.chart.mode, { preserveOpen: true });
 });
+chartSignalToggle?.addEventListener("click", () => {
+  state.chart.showSignals = !state.chart.showSignals;
+  localStorage.setItem("chart_show_signals", state.chart.showSignals ? "on" : "off");
+  updateChartSignalToggleUI();
+  if (state.chart.ticker) void openChart(state.chart.ticker, state.chart.mode, { preserveOpen: true, refresh: false });
+});
 chartModal?.addEventListener("click", (event) => {
   if (event.target === chartModal) closeChart();
 });
+frameworkModalClose?.addEventListener("click", closeFrameworkModal);
+frameworkModal?.addEventListener("click", (event) => {
+  if (event.target === frameworkModal) closeFrameworkModal();
+});
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeChart();
+  if (event.key === "Escape") closeFrameworkModal();
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
@@ -193,6 +221,7 @@ async function initializeDashboard() {
     await startDashboardSession();
   }
   await loadView();
+  scheduleDeferredProWarmups();
   scheduleBootRefresh();
 }
 
@@ -240,6 +269,7 @@ async function loadView() {
     else if (state.view === "movers") await renderMovers();
     else if (state.view === "watchlist") await renderWatchlist();
     else if (state.view === "browser") await renderBrowser();
+    else if (state.view === "tradeideas") await renderTradeIdeas();
     else if (state.view === "ai") await renderAiBrain();
     else if (state.view === "overview") await renderOverview();
     else if (["intraday", "swing", "futures", "bitcoin", "crypto"].includes(state.view)) await renderSignals(state.view);
@@ -347,8 +377,8 @@ async function setPower(enabled, reason = "manual") {
     lastUpdated.textContent = "System starting";
     await startDashboardSession();
     resetInactivityTimer();
-    if (state.view === "dashboard") await runFreshScan("swing");
-    else await loadView();
+    await loadView();
+    scheduleDeferredProWarmups();
     scheduleBootRefresh();
     return;
   }
@@ -433,6 +463,16 @@ function renderBootingState() {
     </section>
   `;
   document.querySelector("#power-toggle")?.addEventListener("click", () => setPower(false));
+}
+
+function scheduleDeferredProWarmups() {
+  window.setTimeout(() => {
+    void getJson("/api/pro/crypto", { silent: true }).catch(() => null);
+  }, PRO_WARMUP_CRYPTO_DELAY_MS);
+
+  window.setTimeout(() => {
+    void getJson("/api/pro/momentum", { silent: true }).catch(() => null);
+  }, PRO_WARMUP_MOMENTUM_DELAY_MS);
 }
 
 function renderOfflineState() {
@@ -535,29 +575,35 @@ function handleGlobalSearch(event) {
 }
 
 async function renderDashboardHome() {
-  const [overview, execution, alerts, news, latestSignals, lifecycle, journal] = await Promise.all([
+  const [overview, alerts, news, tradeIdeasBrain, lifecycle, journal] = await Promise.all([
     getJson("/api/dashboard/overview"),
-    getJson("/api/dashboard/execution"),
     getJson("/api/dashboard/alerts"),
     getJson("/api/dashboard/news"),
-    getJson("/api/dashboard/signals?hideExpired=1&sort=quality"),
+    getJson("/api/trade-ideas/brain?mode=intraday&limit=24"),
     getJson("/api/dashboard/lifecycle"),
     getJson("/api/dashboard/journal")
   ]);
-  const plans = execution.plans || [];
+  const tradeIdeas = tradeIdeasBrain?.ok ? tradeIdeasBrain : null;
+  const plans = tradeIdeas?.plans?.length ? tradeIdeas.plans : [];
   const regime = overview.market_regime || {};
   const auto = overview.auto_scan || {};
   const ai = overview.ai_brain || {};
   const session = overview.dashboard_session || {};
   const counts = overview.counts || {};
-  const signalRows = dedupeSignalsByTicker(latestSignals.signals || []);
-  const rankedPlans = dedupePlansByTicker(execution.plans || []);
-  const intertradePlans = (execution.intertrade_plans || []).slice(0, 5);
+  const signalRows = dedupeSignalsByTicker(tradeIdeas?.signals || []);
+  const rankedPlans = dedupePlansByTicker(plans);
+  const intertradePlans = (tradeIdeas?.intertrade_plans || []).slice(0, 5);
   const workflow = getHomeWorkflowGroups(signalRows, rankedPlans);
   const standardReadyNow = workflow.readyNow.filter((plan) => plan.buy_now_type !== "intertrade_take");
+  const mainPlanCandidate =
+    standardReadyNow[0]
+    || intertradePlans[0]
+    || workflow.watchlist[0]
+    || workflow.movingNow[0]
+    || null;
   const intradaySignals = signalRows.filter((signal) => (signal.signal_mode || signal.mode || "") === "intraday");
   const intradayWorkflow = getSignalsModeGroups("intraday", intradaySignals);
-  state.cachedSignals = dedupeSignals(latestSignals.signals || []);
+  state.cachedSignals = dedupeSignals(tradeIdeas?.signals || []);
   if (!state.selectedHomeTicker) {
     state.selectedHomeTicker = workflow.readyNow[0]?.ticker || workflow.movingNow[0]?.ticker || workflow.watchlist[0]?.ticker || "";
   }
@@ -578,6 +624,7 @@ async function renderDashboardHome() {
           : workflow.watchlist.length
             ? "Wait. Nothing is clean enough yet, but there are good setups worth watching."
             : "No. There is no clean setup right now. Stay patient and wait for the next scan."}</p>
+        <div class="hero-source-note">${tradeIdeas?.ok ? "Powered by Trade Ideas Premium + ChatGPT brain." : "Trade Ideas Premium is not connected yet, so this stays empty instead of faking data."}</div>
       </div>
       <form class="home-search" id="home-search">
         <input id="home-search-input" type="search" placeholder="Search ticker or company name: NVDA, KRE, BTCUSD, S&P 500">
@@ -587,6 +634,10 @@ async function renderDashboardHome() {
         ${quickSearch("NVDA")} ${quickSearch("KRE")} ${quickSearch("UNG")} ${quickSearch("XLF")} ${quickSearch("BTC")} ${quickSearch("SPX")}
       </div>
     </section>
+    ${panel("Today's Game Plan", renderDecisionFramework("todayplan", {
+      regime,
+      candidate: mainPlanCandidate
+    }))}
     ${state.ui.isMobile
       ? `
         ${panel("System Status", renderMobileStatusStack({ overview, alerts, executionCount: rankedPlans.length }))}
@@ -595,6 +646,7 @@ async function renderDashboardHome() {
           : renderTradeNowEmptyState(workflow.watchlist, signalRows))}
         ${panel("Fast Live Breakout Candidates", renderIntertradeSection(intertradePlans, signalRows))}
         ${panel("Intraday Right Now", renderHomeIntradayPanel(intradayWorkflow, intradaySignals))}
+        ${panel("Trade Ideas Pulse", renderTradeIdeasSummary(tradeIdeas || tradeIdeasBrain || {}))}
         ${panel("Movers", `
           <div class="section-note">Movers are not automatic buys.</div>
           ${renderActionCardGrid(workflow.movingNow.slice(0, 4), "movers")}
@@ -625,6 +677,7 @@ async function renderDashboardHome() {
           ${panel("Fast Live Breakout Candidates", renderIntertradeSection(intertradePlans, signalRows))}
           ${panel("Intraday Trade Board", renderHomeIntradayPanel(intradayWorkflow, intradaySignals))}
         </section>
+        ${panel("Trade Ideas Pulse", renderTradeIdeasSummary(tradeIdeas || tradeIdeasBrain || {}))}
         ${panel("Good Ideas, But Not Buys Yet", renderActionCardGrid(workflow.watchlist.slice(0, 6), "watch"))}
         ${panel("ChatGPT Decision Desk", `
           <div class="brain-summary">
@@ -692,30 +745,119 @@ function renderIntertradeSection(plans = [], fallbackSignals = []) {
   return noTradeState("No clean live breakout candidate right now.");
 }
 
+function renderTradeIdeasSummary(data = {}) {
+  if (!data?.ok) {
+    return `
+      <div class="section-note">${data?.premium_only ? "Trade Ideas premium feed is not connected yet." : "Trade Ideas is not connected yet."}</div>
+      <div class="ti-empty">
+        <p>${escapeHtml(data?.error || "Point the platform at your Trade Ideas alert log CSV to turn this on.")}</p>
+        <div class="copy-row">
+          <button class="action-btn primary-action" type="button" data-view-jump="tradeideas">Open Trade Ideas Center</button>
+          ${data?.premium_only ? "" : `<a class="action-btn" href="${escapeAttr(data?.race_url || "https://www.trade-ideas.com/TIPro/stockracecentral/")}" target="_blank" rel="noreferrer">Open Stock Race Central</a>`}
+        </div>
+      </div>
+    `;
+  }
+
+  const leaders = data.leaders || [];
+  const alerts = data.alerts || [];
+  return `
+    <div class="section-note">${data?.premium_only
+      ? "This feed is coming from your own Trade Ideas premium export, not the public race board."
+      : "This is the live Trade Ideas feed flowing into the dashboard."}</div>
+    <div class="ti-metrics">
+      <div><span>Live alerts</span><strong>${fmt(data.count || alerts.length || 0)}</strong></div>
+      <div><span>Hot tickers</span><strong>${fmt(leaders.length)}</strong></div>
+      <div><span>Latest update</span><strong>${escapeHtml(formatClockTime(data.updated_at || alerts[0]?.timestamp))}</strong></div>
+    </div>
+    ${leaders.length ? `
+      <div class="ti-chip-row">
+        ${leaders.slice(0, 6).map((leader) => `
+          <button class="action-btn" type="button" data-quick-search="${escapeAttr(leader.ticker)}">
+            ${escapeHtml(leader.ticker)} · ${fmt(leader.hits)} hit${leader.hits === 1 ? "" : "s"}
+          </button>
+        `).join("")}
+      </div>
+    ` : ""}
+    ${alerts.length ? `
+      <div class="ti-alert-list">
+        ${alerts.slice(0, 4).map(renderTradeIdeasAlertCard).join("")}
+      </div>
+    ` : `<div class="ti-empty"><p>No Trade Ideas alerts are in the log yet.</p></div>`}
+    <div class="copy-row">
+      <button class="action-btn primary-action" type="button" data-view-jump="tradeideas">Open Trade Ideas Center</button>
+      ${data?.premium_only ? "" : `<a class="action-btn" href="${escapeAttr(data.race_url || "https://www.trade-ideas.com/TIPro/stockracecentral/")}" target="_blank" rel="noreferrer">Open Stock Race Central</a>`}
+    </div>
+  `;
+}
+
+async function renderTradeIdeas() {
+  const [data, status] = await Promise.all([
+    getJson("/api/trade-ideas/alerts?limit=120"),
+    getJson("/api/trade-ideas/status")
+  ]);
+  content.innerHTML = `
+    <section class="page-intro">
+      <div>
+        <p class="eyebrow">Trade Ideas Center</p>
+        <h3>Use Trade Ideas as the scanner, then let this platform decide what is actually tradeable.</h3>
+        <p>${data?.premium_only
+          ? "This page is now locked to your own Trade Ideas premium export. If your premium alert log is not connected, this page stays empty on purpose."
+          : "Latest alerts, hot tickers, and quick chart jumps all land here. This page is meant to be the bridge between the raw scanner feed and your actual execution decisions."}</p>
+      </div>
+      <div class="rule-box">
+        <strong>${data?.premium_only ? "Premium account only" : "Source of truth"}</strong>
+        <span>${data?.premium_only
+          ? "Only alerts exported from your logged-in Trade Ideas premium account are allowed to power this page."
+          : "Trade Ideas finds the names first. This platform is where you verify chart quality, entry risk, and whether the setup still belongs in Buy Now."}</span>
+      </div>
+    </section>
+    ${panel("Connection Status", renderTradeIdeasStatusPanel(status))}
+    ${panel("Trade Ideas Pulse", renderTradeIdeasSummary(data))}
+    ${panel("Hot Tickers", renderTradeIdeasLeaders(data))}
+    ${panel("Latest Alert Feed", renderTradeIdeasFeed(data))}
+    ${panel("How To Connect It", renderTradeIdeasConnectionGuide(data))}
+  `;
+  updateSystemHealthBadge({
+    label: data?.ok ? `${fmt(data.count || 0)} TI alerts` : "Trade Ideas offline",
+    tone: data?.ok ? "good" : "neutral",
+    detail: "scanner feed"
+  });
+  bindTradeIdeasCenter();
+}
+
 async function renderBuyNow() {
-  const [execution, overview] = await Promise.all([
-    getJson("/api/dashboard/execution"),
+  const [brain, overview] = await Promise.all([
+    getJson("/api/trade-ideas/brain?mode=intraday&limit=28"),
     getJson("/api/dashboard/overview")
   ]);
-  const plans = dedupePlansByTicker(execution.plans || []);
-  const intertradePlans = (execution.intertrade_plans || []).slice(0, 5);
-  const signalData = await getJson("/api/dashboard/signals?hideExpired=1&sort=quality");
-  const signalRows = dedupeSignalsByTicker(signalData.signals || []);
-  state.cachedSignals = dedupeSignals(signalData.signals || []);
+  const plans = dedupePlansByTicker(brain?.plans || []);
+  const intertradePlans = (brain?.intertrade_plans || []).slice(0, 5);
+  const signalRows = dedupeSignalsByTicker(brain?.signals || []);
+  state.cachedSignals = dedupeSignals(brain?.signals || []);
   const groups = getExecutionGroups(plans, signalRows);
+  const regime = overview.market_regime || {};
   const standardReadyNow = groups.readyNow.filter((plan) => plan.buy_now_type !== "intertrade_take");
   content.innerHTML = `
     <section class="page-intro">
       <div>
         <p class="eyebrow">Buy Now</p>
         <h3>What can I trade right now?</h3>
-        <p>Green does not mean blindly buy. It means this is the best candidate right now. Confirm the chart first.</p>
+        <p>Trade Ideas is feeding the names. ChatGPT is grading which ones are still close enough, clean enough, and worth risking right now.</p>
       </div>
       <div class="rule-box">
-        <strong>Trader workflow</strong>
-        <span>Start with Ready Now, then check Wait for Pullback, then scan Strong Momentum without treating every mover like a buy.</span>
+        <strong>${brain?.premium_only ? "Premium Trade Ideas only" : brain?.ok ? "Trade Ideas first" : "Scanner fallback"}</strong>
+        <span>${brain?.ok
+          ? brain?.premium_only
+            ? "The names below are coming only from your own premium Trade Ideas export, then filtered by the platform’s ChatGPT decision engine."
+            : "The names below are coming from Trade Ideas first, then filtered by the platform’s ChatGPT decision engine."
+          : "Trade Ideas brain is unavailable right now, so the page may feel empty until the feed comes back."}</span>
       </div>
     </section>
+    ${panel("How The System Picks A Buy Right Now", renderDecisionFramework("buynow", {
+      regime,
+      candidate: standardReadyNow[0] || intertradePlans[0] || groups.watchOnly[0] || groups.strongMomentum[0] || null
+    }))}
     ${panel("Fast Live Breakout Candidates", renderIntertradeSection(intertradePlans, signalRows))}
     ${panel("Ready Now", standardReadyNow.length
       ? renderTradeSection(standardReadyNow.slice(0, 5), { source: "plan", sectionKind: "ready" })
@@ -874,6 +1016,12 @@ async function renderBrowser() {
       `)}
       ${panel("Decision Box", renderBrowserDecisionBox(data, timing))}
     </section>
+    ${panel("How This Ticker Is Being Judged", renderDecisionFramework("browser", {
+      candidate: decisionTarget?.ticker ? { ...decisionTarget, ticker: data.ticker, quote } : { ticker: data.ticker, quote },
+      regime: {
+        regime: inferBrowserRegime(quote)
+      }
+    }))}
     ${panel(`${escapeHtml(data.ticker)} News`, renderNewsCards(data.news || []))}
     ${panel(`${escapeHtml(data.ticker)} Posts & Ideas`, renderSocialLinks(data.social_posts || []))}
     ${renderAdvancedDetails("Advanced Details", signal.ticker ? renderSignalTable([signal], { compact: true }) : noSignalForTicker(data.ticker))}
@@ -930,6 +1078,9 @@ async function renderAiBrain() {
           <div><strong>4. You execute</strong><span>The website shows the plan; you place trades manually in Webull.</span></div>
         </div>
       `)}
+      ${panel("How The Brain Makes A Pick", renderDecisionFramework("brain", {
+        candidate: state.cachedSignals[0] || null
+      }))}
       ${panel("AI Safety Boundaries", `
         <div class="ai-flow">
           <div><strong>No broker control</strong><span>ChatGPT cannot place trades.</span></div>
@@ -966,13 +1117,16 @@ async function renderAiBrain() {
 }
 
 async function renderSignals(mode) {
+  const isTradeIdeasIntraday = mode === "intraday";
   const query = new URLSearchParams({ mode, sort: state.signals.sort });
   if (state.signals.search) query.set("search", state.signals.search);
   if (state.signals.onlyTake) query.set("take", "1");
   if (state.signals.minConfidence) query.set("minConfidence", "7");
   if (state.signals.minQuality) query.set("minQuality", "70");
   if (state.signals.hideExpired) query.set("hideExpired", "1");
-  const data = await getJson(`/api/dashboard/signals?${query}`);
+  const data = isTradeIdeasIntraday
+    ? await getJson("/api/trade-ideas/brain?mode=intraday&limit=36")
+    : await getJson(`/api/dashboard/signals?${query}`);
   const signals = dedupeSignalsByTicker(data.signals || []);
   state.cachedSignals = dedupeSignals(data.signals || []);
   const sectionEmptyState = renderMeaningfulEmptyState("signals", mode, { signals });
@@ -987,13 +1141,24 @@ async function renderSignals(mode) {
       <div>
         <p class="eyebrow">${capitalize(mode)}</p>
         <h3>${modeTitle}</h3>
-        <p>${modeDescription}</p>
+        <p>${isTradeIdeasIntraday
+          ? data?.premium_only
+            ? "This board is now fed only by your own Trade Ideas premium export and filtered by the ChatGPT brain before it becomes a live intraday idea."
+            : "This board is now fed by Trade Ideas first and filtered by the ChatGPT brain before it becomes a live intraday idea."
+          : modeDescription}</p>
       </div>
       <div class="rule-box">
-        <strong>How to read this</strong>
-        <span>Green means actionable, yellow means watch, muted red means ignore for now.</span>
+        <strong>${isTradeIdeasIntraday ? (data?.premium_only ? "Premium Trade Ideas + ChatGPT" : "Trade Ideas + ChatGPT") : "How to read this"}</strong>
+        <span>${isTradeIdeasIntraday
+          ? data?.premium_only
+            ? "Your premium Trade Ideas feed finds the moving names. ChatGPT decides whether they are buy now, wait, or skip."
+            : "Trade Ideas finds the moving names. ChatGPT decides whether they are buy now, wait, or skip."
+          : "Green means actionable, yellow means watch, muted red means ignore for now."}</span>
       </div>
     </section>
+    ${mode === "intraday" ? panel("How Intraday Picks Are Chosen", renderDecisionFramework("intraday", {
+      candidate: signalGroups.readyNow?.[0] || signalGroups.movingNow?.[0] || signalGroups.watchOnly?.[0] || null
+    })) : ""}
     <section class="panel">
       <div class="panel-header">
         <h3>${capitalize(mode)} Board</h3>
@@ -1073,6 +1238,413 @@ function renderSignalsModeLayout(mode, groups = {}) {
   `;
 }
 
+function renderDecisionFramework(section = "buynow", context = {}) {
+  const variants = {
+    todayplan: {
+      title: "This is the one clean plan the system wants you focused on first.",
+      summary: "The platform picks the best current leader, checks market wind, confirms liquidity and structure, then keeps the plan simple: entry, stop, target, and whether the setup is still worth taking right now.",
+      focus: "Today’s Game Plan is meant to reduce noise. Start with one clean main idea, keep the risk tight, and avoid bouncing between random tickers.",
+      decision: "If the main candidate is close enough to entry with clean risk, treat it like the first plan. If it stretches or weakens, wait or move to the backup instead of forcing a trade."
+    },
+    buynow: {
+      title: "This is the repeatable filter behind Buy Now.",
+      summary: "The system starts with market wind, then checks liquidity, momentum, catalyst risk, and whether the entry is still close enough to take without chasing.",
+      focus: "Only the names that still have a clean entry, stop, and reward/risk make it into Buy Now.",
+      decision: "If the market wind is supportive and the stock is liquid, near entry, and backed by momentum, it can become TAKE. If timing slips, it drops to WAIT or SKIP."
+    },
+    intraday: {
+      title: "Intraday is about speed, not prediction.",
+      summary: "The system checks broad index tone first, then looks for liquid names with strong same-day momentum, a nearby trigger, and enough room to move before the setup gets late.",
+      focus: "Intraday cards should answer one question fast: buy now, wait for the breakout, wait for the pullback, or skip it.",
+      decision: "A bullish chart can still be a bad intraday trade if the move is extended, volume is weak, or the market wind is against it."
+    },
+    brain: {
+      title: "ChatGPT is not guessing from one price print.",
+      summary: "The brain uses market regime, quote context, indicator context, catalyst/news context, and risk math before it turns a candidate into TAKE, WATCH, or SKIP.",
+      focus: "The final call is not just ‘good stock or bad stock’ — it is ‘good stock, good timing, good risk, or not.’",
+      decision: "That is why the same ticker can move from TAKE to WAIT or SKIP when price stretches, news changes, or reward/risk breaks."
+    },
+    browser: {
+      title: "This is the exact checklist being used on the ticker you searched.",
+      summary: "Market Browser now explains the current ticker the same way the system explains Buy Now and Intraday: market wind, structure, entry quality, and whether the idea is still clean enough to act on.",
+      focus: "This panel is the fast audit for one symbol: what the market is doing, what this ticker is doing, and whether timing still works.",
+      decision: "If the market wind, setup quality, and entry proximity all line up, the ticker can be actionable. If one of those breaks, it becomes wait or skip."
+    }
+  };
+  const copy = variants[section] || variants.buynow;
+  const candidate = context.candidate || null;
+  const hasDecisionData = Boolean(candidate && (
+    candidate.final_decision ||
+    candidate.entry ||
+    candidate.buy_trigger ||
+    candidate.reason ||
+    candidate.momentum_reason ||
+    candidate.execution_plan?.entry
+  ));
+  const timing = candidate ? getTimingProfile(candidate) : null;
+  const entry = candidate ? parseNumericValue(candidate.entry || candidate.buy_trigger) : NaN;
+  const stop = candidate ? parseNumericValue(candidate.stop || candidate.sell_trigger) : NaN;
+  const current = candidate ? getCurrentPrice(candidate) : NaN;
+  const deltaPct = Number.isFinite(current) && Number.isFinite(entry) && entry !== 0
+    ? ((current - entry) / entry) * 100
+    : NaN;
+  const regime = context.regime?.regime || "mixed";
+  const regimeText = regime === "bullish"
+    ? "Bullish market wind is helping long setups."
+    : regime === "bearish"
+      ? "Bearish market wind is making long entries harder."
+      : "Mixed market wind means entries need to be cleaner.";
+  const candidateName = candidate?.ticker || "No active candidate";
+  const engine = candidate ? getSignalEngineLabel(candidate) : "scanner";
+  const executionLike = candidate?.execution_plan || candidate || {};
+  const volumeNote = candidate
+    ? candidate.volume_score != null
+      ? `Volume score ${fmt(candidate.volume_score)}.`
+      : candidate.momentum_reason || getPlainSignalReason(candidate, candidate.final_decision || "watch")
+    : "No liquidity note available yet.";
+  const liquidityText = candidate
+    ? `${candidateName} is being treated as ${getAssetLabel(candidate.asset_class || "") || "equity"} with quality ${fmt(candidate.final_quality_score || candidate.setup_score || 0)} and confidence ${fmt(candidate.confidence || 0)}.`
+    : "No live candidate is leading right now, so the system is staying selective.";
+  const catalystText = candidate
+    ? (candidate.momentum_reason || candidate.trend_label || getPlainSignalReason(candidate, candidate.final_decision || "watch"))
+    : "When no chart has a clean reason to move, the system waits instead of forcing a trade.";
+  const riskText = candidate
+    ? `Entry ${formatFieldText(candidate.entry || candidate.buy_trigger)}, stop ${formatFieldText(candidate.stop || candidate.sell_trigger)}, current ${Number.isFinite(current) ? fmt(current) : "n/a"}${Number.isFinite(deltaPct) ? `, entry distance ${fmt(deltaPct)}%` : ""}.`
+    : "No live entry, stop, and size combination is clean enough right now.";
+  const finalText = candidate
+    ? `${candidateName} is currently ${timing?.actionLabel || String(candidate.final_decision || "watch").toUpperCase()} via the ${engine}.`
+    : copy.decision;
+  const steps = [
+    {
+      label: "1. Goal And Clock",
+      text: section === "intraday"
+        ? "Use a same-day time window and keep the loss small enough that one bad trade cannot hurt the account."
+        : "Decide the hold window first. A trade for the next hour is graded differently from a trade for the next week."
+    },
+    {
+      label: "2. Market Wind",
+      text: `SPY, QQQ, IWM, rates, and headline tone set the bias. ${regimeText}`
+    },
+    {
+      label: "3. Liquidity And Quality",
+      text: candidate ? liquidityText : "The system prefers liquid names with cleaner participation, less slippage, and less balance-sheet/news blowup risk."
+    },
+    {
+      label: "4. Catalyst And Structure",
+      text: candidate ? catalystText : "It looks for a real reason the move can continue: momentum, breakout pressure, sector strength, or a catalyst the market can reward."
+    },
+    {
+      label: "5. Entry, Stop, And Size",
+      text: candidate ? riskText : "A trade only becomes actionable when the entry is near enough, the stop is clear, and the reward/risk still makes sense."
+    },
+    {
+      label: "6. Final Decision",
+      text: finalText
+    }
+  ];
+
+  return `
+    <div class="decision-framework">
+      <div class="decision-framework-intro">
+        <strong>${escapeHtml(copy.title)}</strong>
+        <p>${escapeHtml(copy.summary)}</p>
+      </div>
+      <div class="decision-framework-live">
+        ${renderFrameworkActionCard({
+          className: "decision-framework-live-card",
+          action: hasDecisionData ? "live-candidate" : "",
+          hint: hasDecisionData ? "Open chart and browser" : "",
+          title: "Live candidate",
+          strong: candidateName,
+          body: candidate ? `${timing?.actionLabel || candidate.final_decision || "watch"} · ${candidate.trend_label || engine}` : "No live leader right now.",
+          context: {
+            ticker: candidate?.ticker,
+            mode: candidate?.mode || candidate?.signal_mode || inferModeFromTicker(candidate?.ticker || ""),
+            asset: candidate?.asset_class || "",
+            confidence: candidate?.confidence,
+            quality: candidate?.final_quality_score,
+            reason: candidate?.momentum_reason || candidate?.reason || "",
+            entry: candidate?.entry || executionLike?.entry,
+            stop: candidate?.stop || executionLike?.stop,
+            target1: candidate?.target1 || executionLike?.target1,
+            target2: candidate?.target2 || executionLike?.target2,
+            timing: timing?.label || "",
+            actionLabel: timing?.actionLabel || candidate?.final_decision || "",
+            finalDecision: candidate?.final_decision || "",
+            decisionReasons: (candidate?.decision_reasons || executionLike?.decision_reasons || []).join(" | "),
+            intertrade: candidate?.intertrade_score ?? executionLike?.intertrade_score ?? "",
+            volumeNote
+          }
+        })}
+        ${renderFrameworkActionCard({
+          className: "decision-framework-live-card",
+          action: "market-wind",
+          hint: "Open market wind",
+          title: "Market wind",
+          strong: regime.toUpperCase(),
+          body: regimeText,
+          context: {
+            ticker: candidate?.ticker,
+            mode: candidate?.mode || candidate?.signal_mode || "",
+            actionLabel: timing?.actionLabel || "",
+            finalDecision: candidate?.final_decision || ""
+          }
+        })}
+      </div>
+      <div class="decision-framework-grid">
+        ${renderFrameworkActionCard({
+          className: "decision-framework-step",
+          action: "goal-clock",
+          hint: "Tap for details",
+          title: steps[0].label,
+          body: steps[0].text,
+          context: { ticker: candidate?.ticker, mode: section === "intraday" ? "intraday" : candidate?.mode || candidate?.signal_mode || state.view }
+        })}
+        ${renderFrameworkActionCard({
+          className: "decision-framework-step",
+          action: "market-wind",
+          hint: "Open market wind",
+          title: steps[1].label,
+          body: steps[1].text,
+          context: { ticker: candidate?.ticker, mode: candidate?.mode || candidate?.signal_mode || "" }
+        })}
+        ${renderFrameworkActionCard({
+          className: "decision-framework-step",
+          action: hasDecisionData ? "liquidity-quality" : "",
+          hint: hasDecisionData ? "Tap for details" : "",
+          title: steps[2].label,
+          body: steps[2].text,
+          context: {
+            ticker: candidate?.ticker,
+            mode: candidate?.mode || candidate?.signal_mode || "",
+            asset: candidate?.asset_class || "",
+            confidence: candidate?.confidence,
+            quality: candidate?.final_quality_score || candidate?.setup_score || "",
+            reason: candidate?.reason || candidate?.momentum_reason || "",
+            volumeNote
+          }
+        })}
+        ${renderFrameworkActionCard({
+          className: "decision-framework-step",
+          action: hasDecisionData ? "catalyst-structure" : "",
+          hint: hasDecisionData ? "Open chart" : "",
+          title: steps[3].label,
+          body: steps[3].text,
+          context: {
+            ticker: candidate?.ticker,
+            mode: candidate?.mode || candidate?.signal_mode || "",
+            reason: candidate?.momentum_reason || candidate?.reason || "",
+            trend: candidate?.trend_label || "",
+            bull: candidate?.bull_run_flag ? "yes" : "no"
+          }
+        })}
+        ${renderFrameworkActionCard({
+          className: "decision-framework-step",
+          action: hasDecisionData ? "entry-stop-size" : "",
+          hint: hasDecisionData ? "Open execution" : "",
+          title: steps[4].label,
+          body: steps[4].text,
+          context: {
+            ticker: candidate?.ticker,
+            mode: candidate?.mode || candidate?.signal_mode || "",
+            entry: candidate?.entry || executionLike?.entry,
+            stop: candidate?.stop || executionLike?.stop,
+            target1: candidate?.target1 || executionLike?.target1,
+            target2: candidate?.target2 || executionLike?.target2,
+            riskDollars: executionLike?.estimated_risk_dollars || "",
+            shares: executionLike?.suggested_shares || executionLike?.suggested_contracts || ""
+          }
+        })}
+        ${renderFrameworkActionCard({
+          className: "decision-framework-step",
+          action: hasDecisionData ? "final-decision" : "",
+          hint: hasDecisionData ? "Why this decision?" : "",
+          title: steps[5].label,
+          body: steps[5].text,
+          context: {
+            ticker: candidate?.ticker,
+            mode: candidate?.mode || candidate?.signal_mode || "",
+            finalDecision: candidate?.final_decision || "",
+            timing: timing?.label || "",
+            actionLabel: timing?.actionLabel || "",
+            confidence: candidate?.confidence || "",
+            quality: candidate?.final_quality_score || "",
+            intertrade: candidate?.intertrade_score ?? executionLike?.intertrade_score ?? "",
+            decisionReasons: (candidate?.decision_reasons || executionLike?.decision_reasons || []).join(" | "),
+            reason: candidate?.reason || candidate?.momentum_reason || ""
+          }
+        })}
+      </div>
+      <div class="decision-framework-bottom">
+        <div class="decision-framework-callout">
+          <strong>What the platform is doing</strong>
+          <p>${escapeHtml(candidate ? `${copy.focus} Right now the system is centered on ${candidateName}.` : copy.focus)}</p>
+        </div>
+        <div class="decision-framework-callout">
+          <strong>Simple recap</strong>
+          <p>${escapeHtml(candidate ? `Follow the market wind, demand liquidity and a real reason to move, then only act if ${candidateName} is still near entry with clean risk.` : "Follow the market wind, demand liquidity and a real reason to move, then only act if entry, stop, and reward/risk still line up.")}</p>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderFrameworkActionCard({ className = "", action = "", hint = "", title = "", strong = "", body = "", context = {} }) {
+  const clickable = Boolean(action);
+  const attrs = [];
+  if (clickable) {
+    attrs.push(`data-framework-action="${escapeAttr(action)}"`);
+    if (hint) attrs.push(`data-framework-hint="${escapeAttr(hint)}"`);
+    for (const [key, value] of Object.entries(context || {})) {
+      if (value === null || value === undefined || value === "") continue;
+      const attrKey = key.replace(/[A-Z]/g, (match) => `-${match.toLowerCase()}`);
+      attrs.push(`data-framework-${escapeAttr(attrKey)}="${escapeAttr(String(value))}"`);
+    }
+  }
+  const tag = clickable ? "button" : "div";
+  const typeAttr = clickable ? ` type="button"` : "";
+  const hintMarkup = clickable && hint ? `<small class="decision-framework-hint">${escapeHtml(hint)}</small>` : "";
+  return `
+    <${tag}${typeAttr} class="${escapeAttr(`${className}${clickable ? " clickable" : ""}`)}" ${attrs.join(" ")}>
+      <span>${escapeHtml(title)}</span>
+      ${strong ? `<strong>${escapeHtml(strong)}</strong>` : ""}
+      <p>${escapeHtml(body)}</p>
+      ${hintMarkup}
+    </${tag}>
+  `;
+}
+
+function openFrameworkModal(title, body) {
+  if (!frameworkModal || !frameworkModalTitle || !frameworkModalContent) return;
+  frameworkModalTitle.textContent = title || "Details";
+  frameworkModalContent.innerHTML = body;
+  frameworkModal.classList.remove("hidden");
+}
+
+function closeFrameworkModal() {
+  frameworkModal?.classList.add("hidden");
+  if (frameworkModalContent) frameworkModalContent.innerHTML = "";
+}
+
+function renderFrameworkEmptyState(ticker = "", mode = "", backView = "buynow") {
+  return `
+    <div class="framework-empty">
+      <p>No extra detail available yet.</p>
+      <div class="copy-row">
+        ${ticker ? `<button class="action-btn" type="button" data-empty-action="chart" data-empty-ticker="${escapeAttr(ticker)}" data-empty-mode-hint="${escapeAttr(mode || inferModeFromTicker(ticker))}">Open chart</button>` : ""}
+        <button class="action-btn" type="button" data-empty-action="scan" data-empty-mode="${escapeAttr(mode || "all")}">Run fresh scan</button>
+        <button class="action-btn" type="button" data-view-jump="${escapeAttr(backView)}">Back to ${escapeHtml(views[backView]?.title || "Buy Now")}</button>
+      </div>
+    </div>
+  `;
+}
+
+async function openMarketWindDetail() {
+  openFrameworkModal("Market Wind", `<div class="framework-loading">Loading market wind...</div>`);
+  try {
+    const [overview, spy, qqq, iwm] = await Promise.all([
+      getJson("/api/dashboard/overview"),
+      getJson("/api/dashboard/ticker?symbol=SPY"),
+      getJson("/api/dashboard/ticker?symbol=QQQ"),
+      getJson("/api/dashboard/ticker?symbol=IWM")
+    ]);
+    const regime = overview.market_regime || {};
+    openFrameworkModal("Market Wind", `
+      <div class="framework-detail-grid">
+        <div><span>Current regime</span><strong>${escapeHtml(regime.regime || "unknown")}</strong></div>
+        <div><span>SPY</span><strong>${fmt(spy.quote?.changePercent)}%</strong></div>
+        <div><span>QQQ</span><strong>${fmt(qqq.quote?.changePercent)}%</strong></div>
+        <div><span>IWM</span><strong>${fmt(iwm.quote?.changePercent)}%</strong></div>
+      </div>
+      <p class="summary-text">${escapeHtml(getMarketWindExplanation(regime))}</p>
+    `);
+  } catch (error) {
+    openFrameworkModal("Market Wind", `${renderFrameworkEmptyState("SPY", "intraday", state.view)}<p class="summary-text">${escapeHtml(error.message || "Market wind detail is unavailable right now.")}</p>`);
+  }
+}
+
+async function openGoalClockDetail(button) {
+  openFrameworkModal("Goal And Clock", `<div class="framework-loading">Loading execution settings...</div>`);
+  try {
+    const data = await getJson("/api/dashboard/settings");
+    const execution = data.execution || {};
+    const mode = button.dataset.frameworkMode || state.view;
+    openFrameworkModal("Goal And Clock", `
+      <div class="framework-detail-grid">
+        <div><span>Intraday</span><strong>Minutes / hours</strong></div>
+        <div><span>Swing</span><strong>1 to 5 days</strong></div>
+        <div><span>Futures-style</span><strong>Index / sector timing</strong></div>
+        <div><span>Mode now</span><strong>${escapeHtml(mode)}</strong></div>
+        <div><span>Account size</span><strong>$${fmt(execution.account_size)}</strong></div>
+        <div><span>Risk %</span><strong>${fmt(execution.risk_pct)}%</strong></div>
+        <div><span>Max position %</span><strong>${fmt(execution.max_position_pct)}%</strong></div>
+      </div>
+      <p class="summary-text">The system sizes the plan around your configured account, risk per trade, and time window before it turns a setup into BUY NOW, WAIT, or SKIP.</p>
+    `);
+  } catch (error) {
+    openFrameworkModal("Goal And Clock", `${renderFrameworkEmptyState(button.dataset.frameworkTicker || "", button.dataset.frameworkMode || "", state.view)}<p class="summary-text">${escapeHtml(error.message || "No extra detail available yet.")}</p>`);
+  }
+}
+
+function openLiquidityQualityDetail(button) {
+  const ticker = button.dataset.frameworkTicker || "";
+  const asset = button.dataset.frameworkAsset || "unknown";
+  const quality = button.dataset.frameworkQuality || "—";
+  const confidence = button.dataset.frameworkConfidence || "—";
+  const reason = button.dataset.frameworkReason || "No reason text available yet.";
+  const volumeNote = button.dataset.frameworkVolumeNote || "No liquidity or volume note available yet.";
+  openFrameworkModal("Liquidity And Quality", `
+    <div class="framework-detail-grid">
+      <div><span>Ticker</span><strong>${escapeHtml(ticker || "—")}</strong></div>
+      <div><span>Asset type</span><strong>${escapeHtml(asset)}</strong></div>
+      <div><span>Quality</span><strong>${escapeHtml(String(quality))}</strong></div>
+      <div><span>Confidence</span><strong>${escapeHtml(String(confidence))}</strong></div>
+    </div>
+    <p class="summary-text">${escapeHtml(reason)}</p>
+    <p class="summary-text">${escapeHtml(volumeNote)}</p>
+    ${!ticker ? renderFrameworkEmptyState("", "", state.view) : ""}
+  `);
+}
+
+function openFinalDecisionDetail(button) {
+  const ticker = button.dataset.frameworkTicker || "";
+  const finalDecision = button.dataset.frameworkFinalDecision || "unknown";
+  const timing = button.dataset.frameworkTiming || "No timing label";
+  const actionLabel = button.dataset.frameworkActionLabel || finalDecision;
+  const confidence = button.dataset.frameworkConfidence || "—";
+  const quality = button.dataset.frameworkQuality || "—";
+  const intertrade = button.dataset.frameworkIntertrade || "";
+  const reasons = button.dataset.frameworkDecisionReasons || button.dataset.frameworkReason || "No extra decision reasons available yet.";
+  openFrameworkModal("Why This Decision?", `
+    <div class="framework-detail-grid">
+      <div><span>Ticker</span><strong>${escapeHtml(ticker || "—")}</strong></div>
+      <div><span>Final decision</span><strong>${escapeHtml(finalDecision)}</strong></div>
+      <div><span>Timing label</span><strong>${escapeHtml(timing)}</strong></div>
+      <div><span>Action now</span><strong>${escapeHtml(actionLabel)}</strong></div>
+      <div><span>Confidence</span><strong>${escapeHtml(String(confidence))}</strong></div>
+      <div><span>Quality</span><strong>${escapeHtml(String(quality))}</strong></div>
+      ${intertrade ? `<div><span>Intertrade</span><strong>${escapeHtml(String(intertrade))}</strong></div>` : ""}
+    </div>
+    <p class="summary-text">${escapeHtml(reasons)}</p>
+    ${!ticker ? renderFrameworkEmptyState("", "", state.view) : ""}
+  `);
+}
+
+function getMarketWindExplanation(regime = {}) {
+  const stateLabel = regime.regime || "mixed";
+  if (stateLabel === "bullish") return "Bullish market wind is helping long setups. Stronger index tone usually makes breakout and continuation trades easier to hold.";
+  if (stateLabel === "bearish") return "Bearish market wind is hurting long setups. Even good charts need tighter risk because index pressure can cap upside fast.";
+  return "Mixed market wind means selectivity matters more. Long setups need cleaner entries and better confirmation.";
+}
+
+function inferBrowserRegime(quote = {}) {
+  const change = Number(quote?.changePercent);
+  if (!Number.isFinite(change)) return "mixed";
+  if (change >= 1) return "bullish";
+  if (change <= -1) return "bearish";
+  return "mixed";
+}
+
 async function renderAlerts() {
   const data = await getJson("/api/dashboard/alerts");
   const delivery = data.delivery || {};
@@ -1127,8 +1699,11 @@ async function renderNews() {
 async function renderExecution() {
   const data = await getJson("/api/dashboard/execution");
   const signalData = await getJson("/api/dashboard/signals?hideExpired=1&sort=quality");
-  const plans = dedupePlansByTicker(data.plans || []);
-  const signals = dedupeSignalsByTicker(signalData.signals || []);
+  const allPlans = dedupePlansByTicker(data.plans || []);
+  const allSignals = dedupeSignalsByTicker(signalData.signals || []);
+  const focusTicker = normalizeDisplayTicker(state.ui.executionFocusTicker || "");
+  const plans = focusTicker ? allPlans.filter((plan) => normalizeDisplayTicker(plan.ticker) === focusTicker) : allPlans;
+  const signals = focusTicker ? allSignals.filter((signal) => normalizeDisplayTicker(signal.ticker) === focusTicker) : allSignals;
   const groups = getExecutionGroups(plans, signals);
   state.cachedSignals = dedupeSignals(signalData.signals || []);
   content.innerHTML = `
@@ -1143,6 +1718,15 @@ async function renderExecution() {
         <span>A TAKE card can still be late. Use the timing label before you do anything.</span>
       </div>
     </section>
+    ${focusTicker ? `
+      <section class="panel">
+        <div class="panel-header">
+          <h3>Filtered To ${escapeHtml(focusTicker)}</h3>
+          <button class="action-btn" type="button" data-clear-execution-filter="1">Show all execution plans</button>
+        </div>
+        <p class="section-note">You opened Execution from the framework panel, so this page is focused on one ticker.</p>
+      </section>
+    ` : ""}
     <section class="grid cols-4">
       ${metric("Ready Now", groups.readyNow.length || 0, "max 5 shown first")}
       ${metric("Risk / Trade", `${fmt(data.settings?.risk_pct)}%`, `$${fmt(data.settings?.max_risk_dollars)}`)}
@@ -1432,6 +2016,162 @@ function renderActionCardGrid(signals, kind = "watch", collapsed = false) {
   }
 
   return body;
+}
+
+function renderTradeIdeasLeaders(data = {}) {
+  const leaders = data?.leaders || [];
+  if (!leaders.length) {
+    return `<div class="ti-empty"><p>${escapeHtml(data?.error || "No hot tickers yet. Once Trade Ideas alerts are flowing, the repeated names will stack up here.")}</p></div>`;
+  }
+  return `
+    <div class="ti-leader-grid">
+      ${leaders.map((leader) => `
+        <article class="ti-leader-card">
+          <div class="ti-leader-head">
+            <strong>${escapeHtml(leader.ticker)}</strong>
+            <span>${fmt(leader.hits)} hit${leader.hits === 1 ? "" : "s"}</span>
+          </div>
+          <p>${escapeHtml(leader.latest_strategy || "Trade Ideas alert")}</p>
+          <div class="ti-card-actions">
+            <button class="copy-btn chart-btn" type="button" data-chart="${escapeAttr(leader.ticker)}" data-chart-mode="intraday">Chart</button>
+            <button class="action-btn" type="button" data-quick-search="${escapeAttr(leader.ticker)}">Browser</button>
+          </div>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderTradeIdeasFeed(data = {}) {
+  const alerts = data?.alerts || [];
+  if (!alerts.length) {
+    return `<div class="ti-empty"><p>${escapeHtml(data?.error || "No Trade Ideas alerts in the feed yet.")}</p></div>`;
+  }
+  return `<div class="ti-feed-grid">${alerts.map(renderTradeIdeasAlertCard).join("")}</div>`;
+}
+
+function renderTradeIdeasAlertCard(alert = {}) {
+  return `
+    <article class="ti-alert-card">
+      <div class="ti-alert-top">
+        <strong>${escapeHtml(alert.ticker || "—")}</strong>
+        <span class="ti-direction ${escapeAttr(alert.direction || "long")}">${escapeHtml(String(alert.direction || "long").toUpperCase())}</span>
+      </div>
+      <p class="ti-alert-strategy">${escapeHtml(alert.strategy || "Trade Ideas alert")}</p>
+      <div class="ti-alert-meta">
+        <span>Price ${formatNullableNumber(alert.price)}</span>
+        <span>Vol ${formatCompactNumber(alert.volume)}</span>
+        <span>RelVol ${formatNullableNumber(alert.rel_volume)}</span>
+      </div>
+      <div class="ti-alert-meta">
+        <span>${escapeHtml(alert.exchange || "scanner feed")}</span>
+        <span>${escapeHtml(formatClockTime(alert.timestamp))}</span>
+      </div>
+      ${alert.note ? `<p class="ti-alert-note">${escapeHtml(alert.note)}</p>` : ""}
+      <div class="ti-card-actions">
+        <button class="copy-btn chart-btn" type="button" data-chart="${escapeAttr(alert.ticker || "")}" data-chart-mode="intraday">Open chart</button>
+        <button class="action-btn" type="button" data-quick-search="${escapeAttr(alert.ticker || "")}">Open browser</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderTradeIdeasConnectionGuide(data = {}) {
+  if (data?.premium_only) {
+    const path = data?.log_path || data?.configured_path || "./data/trade-ideas-alerts.csv";
+    return `
+      <div class="ti-guide">
+        <p>Premium-only mode is on. This platform will only use alerts exported from your own logged-in Trade Ideas premium account.</p>
+        <div class="framework-detail-grid">
+          <div><span>Premium log path</span><strong>${escapeHtml(path)}</strong></div>
+          <div><span>Fallbacks</span><strong>Public web feed disabled</strong></div>
+        </div>
+        <p class="summary-text">Open your Trade Ideas premium desktop app, enable alert logging/export, then set <code>TRADE_IDEAS_ALERT_LOG</code> to that file path and restart the server.</p>
+      </div>
+    `;
+  }
+
+  const path = data?.log_path || data?.configured_path || "./data/trade-ideas-alerts.csv";
+  return `
+    <div class="ti-guide">
+      <p>Point the platform at your Trade Ideas alert log CSV and this page will update from the scanner feed automatically.</p>
+      <div class="framework-detail-grid">
+        <div><span>Configured path</span><strong>${escapeHtml(path)}</strong></div>
+        <div><span>External board</span><strong><a href="${escapeAttr(data?.race_url || "https://www.trade-ideas.com/TIPro/stockracecentral/")}" target="_blank" rel="noreferrer">Stock Race Central</a></strong></div>
+      </div>
+      <p class="summary-text">Best setup: use Trade Ideas alert logging to CSV, then set <code>TRADE_IDEAS_ALERT_LOG</code> in your environment or drop the file into <code>data/trade-ideas-alerts.csv</code>.</p>
+    </div>
+  `;
+}
+
+function renderTradeIdeasStatusPanel(status = {}) {
+  const connected = Boolean(status?.connected);
+  const source = status?.source || "none";
+  return `
+    <div class="ti-guide">
+      <div class="framework-detail-grid">
+        <div><span>Premium mode</span><strong>${status?.premium_only ? "ON" : "OFF"}</strong></div>
+        <div><span>Connection</span><strong>${connected ? "Connected" : "Not connected"}</strong></div>
+        <div><span>Source</span><strong>${escapeHtml(source)}</strong></div>
+        <div><span>Last seen</span><strong>${escapeHtml(formatClockTime(status?.last_seen_at))}</strong></div>
+      </div>
+      <p class="summary-text">${escapeHtml(status?.message || "Premium Trade Ideas is not connected yet. Log in or set TRADE_IDEAS_ALERT_LOG.")}</p>
+      ${(status?.last_tickers || []).length ? `
+        <div class="ti-chip-row">
+          ${status.last_tickers.map((ticker) => `
+            <button class="action-btn" type="button" data-quick-search="${escapeAttr(ticker)}">${escapeHtml(ticker)}</button>
+          `).join("")}
+        </div>
+      ` : ""}
+      <div class="copy-row">
+        <button class="action-btn primary-action" type="button" data-ti-action="start-session">Start Login Session</button>
+        <button class="action-btn" type="button" data-ti-action="refresh-alerts">Refresh Premium Alerts</button>
+        <button class="action-btn" type="button" data-ti-action="analyze-latest">Analyze Latest Trade Ideas Alerts</button>
+      </div>
+    </div>
+  `;
+}
+
+function bindTradeIdeasCenter() {
+  document.querySelector('[data-ti-action="start-session"]')?.addEventListener("click", async (event) => {
+    const release = setButtonBusy(event.currentTarget, "Launching...");
+    try {
+      const response = await fetch("/api/trade-ideas/start-session", { method: "POST" });
+      const data = await response.json();
+      showMessage(data.message || "Trade Ideas session saver launched.");
+    } catch (error) {
+      showMessage(error.message || "Could not start Trade Ideas session saver.", true);
+    } finally {
+      release();
+    }
+  });
+
+  document.querySelector('[data-ti-action="refresh-alerts"]')?.addEventListener("click", async (event) => {
+    const release = setButtonBusy(event.currentTarget, "Refreshing...");
+    try {
+      await fetch("/api/trade-ideas/refresh", { method: "POST" });
+      showMessage("Trade Ideas premium alerts refreshed.");
+      await loadView();
+    } catch (error) {
+      showMessage(error.message || "Could not refresh Trade Ideas premium alerts.", true);
+    } finally {
+      release();
+    }
+  });
+
+  document.querySelector('[data-ti-action="analyze-latest"]')?.addEventListener("click", async (event) => {
+    const release = setButtonBusy(event.currentTarget, "Analyzing...");
+    try {
+      const response = await fetch("/api/trade-ideas/analyze-latest", { method: "POST" });
+      const data = await response.json();
+      showMessage(data.ok ? "Trade Ideas premium alerts analyzed." : (data.error || "Trade Ideas analysis failed."), !data.ok);
+      await loadView();
+    } catch (error) {
+      showMessage(error.message || "Could not analyze latest Trade Ideas premium alerts.", true);
+    } finally {
+      release();
+    }
+  });
 }
 
 function renderActionCard(signal, kind = "watch") {
@@ -2829,6 +3569,20 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  const frameworkButton = event.target.closest("[data-framework-action]");
+  if (frameworkButton) {
+    await handleFrameworkAction(frameworkButton);
+    return;
+  }
+
+  const clearExecutionFilterButton = event.target.closest("[data-clear-execution-filter]");
+  if (clearExecutionFilterButton) {
+    state.ui.executionFocusTicker = "";
+    await loadView();
+    showMessage("Showing the full execution board again.");
+    return;
+  }
+
   const workflowButton = event.target.closest("[data-workflow-action]");
   if (workflowButton) {
     await handleWorkflowAction(workflowButton.dataset.workflowAction || "");
@@ -2929,6 +3683,63 @@ async function handleEmptyAction(button) {
   }
 }
 
+async function handleFrameworkAction(button) {
+  const action = button.dataset.frameworkAction || "";
+  const ticker = normalizeDisplayTicker(button.dataset.frameworkTicker || "");
+  const mode = button.dataset.frameworkMode || inferModeFromTicker(ticker);
+  if (action === "live-candidate") {
+    if (!ticker) {
+      openFrameworkModal("Live Candidate", renderFrameworkEmptyState("", mode, "buynow"));
+      return;
+    }
+    closeFrameworkModal();
+    state.browserSymbol = ticker;
+    state.selectedHomeTicker = ticker;
+    setActiveView("browser");
+    state.ui.pendingChartTicker = ticker;
+    state.ui.pendingChartMode = mode;
+    await loadView();
+    await openChart(ticker, mode);
+    return;
+  }
+  if (action === "market-wind") {
+    await openMarketWindDetail();
+    return;
+  }
+  if (action === "goal-clock") {
+    await openGoalClockDetail(button);
+    return;
+  }
+  if (action === "liquidity-quality") {
+    openLiquidityQualityDetail(button);
+    return;
+  }
+  if (action === "catalyst-structure") {
+    if (!ticker) {
+      openFrameworkModal("Catalyst And Structure", renderFrameworkEmptyState("", mode, "buynow"));
+      return;
+    }
+    closeFrameworkModal();
+    await openChart(ticker, mode);
+    showMessage(`Opened the ${ticker} chart and signal panel.`);
+    return;
+  }
+  if (action === "entry-stop-size") {
+    if (!ticker) {
+      openFrameworkModal("Entry, Stop, And Size", renderFrameworkEmptyState("", mode, "execution"));
+      return;
+    }
+    closeFrameworkModal();
+    state.ui.executionFocusTicker = ticker;
+    await navigateToView("execution");
+    showMessage(`Filtered Execution to ${ticker}.`);
+    return;
+  }
+  if (action === "final-decision") {
+    openFinalDecisionDetail(button);
+  }
+}
+
 function setActiveView(view) {
   state.view = view || "dashboard";
   if (["intraday", "swing", "futures", "bitcoin", "crypto"].includes(state.view)) {
@@ -2989,6 +3800,7 @@ async function openChart(ticker, mode = "", options = {}) {
   }
   state.chart.ticker = cleanTicker;
   state.chart.mode = mode || inferModeFromTicker(cleanTicker) || "";
+  updateChartSignalToggleUI();
   chartTitle.textContent = `${cleanTicker} Signal Chart`;
   chartFrame.innerHTML = `<div class="chart-loading">Loading ${escapeHtml(cleanTicker)} chart and overlay...</div>`;
   chartModal.classList.remove("hidden");
@@ -2996,8 +3808,10 @@ async function openChart(ticker, mode = "", options = {}) {
   try {
     const params = new URLSearchParams({ ticker: cleanTicker });
     if (mode) params.set("mode", mode);
-    const data = await getJson(`/api/chart-signal?${params.toString()}`);
+    if (options.refresh !== false) params.set("refresh", "1");
+    const data = await getJson(`/api/chart-signals?${params.toString()}`);
     chartFrame.innerHTML = renderChartSurface(data);
+    scheduleChartRefresh();
   } catch (error) {
     chartFrame.innerHTML = `
       <div class="chart-error-state">
@@ -3005,14 +3819,39 @@ async function openChart(ticker, mode = "", options = {}) {
         <p>${escapeHtml(error.message || "Could not load this chart.")}</p>
       </div>
     `;
+    clearChartRefresh();
     showMessage(`Could not load the ${cleanTicker} chart right now.`, true);
   }
   if (!options.preserveOpen) chartModal.classList.remove("hidden");
 }
 
 function closeChart() {
+  clearChartRefresh();
   chartModal?.classList.add("hidden");
   if (chartFrame) chartFrame.innerHTML = "";
+}
+
+function clearChartRefresh() {
+  if (state.chart.refreshTimer) {
+    clearInterval(state.chart.refreshTimer);
+    state.chart.refreshTimer = null;
+  }
+}
+
+function scheduleChartRefresh() {
+  clearChartRefresh();
+  if (!state.chart.ticker || chartModal?.classList.contains("hidden")) return;
+  state.chart.refreshTimer = setInterval(() => {
+    if (!state.chart.ticker || chartModal?.classList.contains("hidden")) return;
+    void openChart(state.chart.ticker, state.chart.mode, { preserveOpen: true, refresh: false });
+  }, 20000);
+}
+
+function updateChartSignalToggleUI() {
+  if (!chartSignalToggle) return;
+  chartSignalToggle.textContent = `Show Signals ${state.chart.showSignals ? "ON" : "OFF"}`;
+  chartSignalToggle.setAttribute("aria-pressed", state.chart.showSignals ? "true" : "false");
+  chartSignalToggle.classList.toggle("active", state.chart.showSignals);
 }
 
 function getTradingViewEmbedUrl(symbol, height = "640", interval = "15") {
@@ -3123,7 +3962,17 @@ function renderChartSurface(data) {
 }
 
 function renderChartOverlay(data) {
-  const levels = Array.isArray(data.levels) ? data.levels : [];
+  if (!state.chart.showSignals) {
+    return `<div class="chart-overlay chart-overlay-empty">Signal overlay hidden. Toggle Show Signals ON to view live chart labels.</div>`;
+  }
+  const levels = Array.isArray(data.signals) && data.signals.length
+    ? data.signals.map((item) => ({
+        key: item.key || item.type.toLowerCase(),
+        label: item.label,
+        tone: item.tone || item.type.toLowerCase(),
+        price: item.price
+      }))
+    : [];
   const range = data.chart_range || {};
   const min = Number(range.min);
   const max = Number(range.max);
@@ -3171,6 +4020,7 @@ function renderChartSignalPanel(data) {
     `;
   }
   const timing = getTimingProfile(data.execution_plan || signal);
+  const signalLabels = Array.isArray(data.signals) ? data.signals : [];
 
   return `
     <div class="chart-panel-head">
@@ -3195,6 +4045,20 @@ function renderChartSignalPanel(data) {
     <div class="next-step-note">
       <strong>What to do now:</strong>
       <span>${escapeHtml(timing.guidance)}</span>
+    </div>
+    <div class="chart-signal-labels">
+      <strong>Live chart labels</strong>
+      ${signalLabels.length
+        ? signalLabels.map((item) => `
+          <div class="chart-signal-label-row">
+            <span class="chart-label-badge ${escapeAttr((item.tone || item.type || "").toLowerCase())}">${escapeHtml(item.label)}</span>
+            <div>
+              <strong>${fmt(item.price)}</strong>
+              <p>${escapeHtml(item.reason || "")}</p>
+            </div>
+          </div>
+        `).join("")
+        : `<p class="small">No active buy/sell signal for this ticker.</p>`}
     </div>
     <p class="chart-summary">${escapeHtml(signal.momentum_reason || signal.webull_summary || "")}</p>
     <div class="copy-row">
@@ -3348,6 +4212,25 @@ function formatTime(value) {
   const date = new Date(Number(value) > 10_000_000_000 ? Number(value) : value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString();
+}
+
+function formatClockTime(value) {
+  if (!value) return "—";
+  const date = new Date(Number(value) > 10_000_000_000 ? Number(value) : value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatCompactNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return "—";
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(number);
+}
+
+function formatNullableNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  return fmt(number);
 }
 
 function simpleValue(value) {

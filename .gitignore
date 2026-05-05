@@ -1,4 +1,7 @@
 .env
+incite-session.json
+tradeideas-session.json
+data/tradeideas-session.json
 data/
 node_modules/
 .DS_Store

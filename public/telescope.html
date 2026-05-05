@@ -1,0 +1,997 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telescope</title>
+  <style>
+    :root {
+      --bg: #08101b;
+      --panel: rgba(11, 20, 35, 0.92);
+      --panel-2: rgba(15, 28, 48, 0.92);
+      --border: rgba(132, 164, 210, 0.16);
+      --text: #edf4ff;
+      --muted: #9db0ca;
+      --green: #41d392;
+      --yellow: #ffcf70;
+      --red: #ff7f7f;
+      --blue: #6bb7ff;
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(54, 106, 180, 0.22), transparent 28%),
+        radial-gradient(circle at top right, rgba(56, 189, 149, 0.16), transparent 24%),
+        linear-gradient(180deg, #07111c, #0d1524 55%, #09101a);
+    }
+
+    .page {
+      display: grid;
+      grid-template-columns: minmax(0, 1.75fr) minmax(320px, 0.85fr);
+      gap: 20px;
+      padding: 24px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(14px);
+    }
+
+    .chart-panel {
+      display: grid;
+      grid-template-rows: auto auto minmax(620px, 1fr) auto;
+    }
+
+    .hero {
+      padding: 22px 24px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--blue);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 34px;
+      line-height: 1;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 760px;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    button,
+    select,
+    input {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 18px;
+      color: var(--text);
+      background: rgba(85, 123, 174, 0.18);
+      cursor: pointer;
+      transition: transform 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+    }
+
+    button:hover { transform: translateY(-1px); background: rgba(104, 147, 206, 0.26); }
+    button:disabled { cursor: wait; opacity: 0.7; transform: none; }
+
+    .primary-btn { background: linear-gradient(135deg, #3d8bff, #39c0a0); font-weight: 700; }
+    .scan-btn { background: linear-gradient(135deg, #1f9c73, #3db7ff); font-weight: 700; }
+    .ghost-btn { background: rgba(255,255,255,0.08); }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(220px, 0.9fr) repeat(3, minmax(120px, 0.32fr)) auto;
+      gap: 12px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+      align-items: center;
+      background: var(--panel-2);
+    }
+
+    .field {
+      display: grid;
+      gap: 7px;
+    }
+
+    .field span {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+    }
+
+    .field input,
+    .field select {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      padding: 12px 14px;
+      color: var(--text);
+      background: rgba(255,255,255,0.05);
+      outline: none;
+    }
+
+    .field input:focus,
+    .field select:focus { border-color: rgba(107, 183, 255, 0.55); }
+
+    .quick-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .quick-bar button.active {
+      background: rgba(65, 211, 146, 0.2);
+      color: #dfffee;
+    }
+
+    .chart-wrap {
+      position: relative;
+      min-height: 620px;
+      background: #050b14;
+    }
+
+    #tv-chart {
+      position: absolute;
+      inset: 0;
+    }
+
+    .chart-overlay {
+      position: absolute;
+      left: 18px;
+      top: 18px;
+      z-index: 4;
+      display: grid;
+      gap: 10px;
+      max-width: 300px;
+    }
+
+    .signal-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      padding: 9px 13px;
+      border-radius: 999px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      font-size: 12px;
+      text-transform: uppercase;
+      background: rgba(12, 26, 45, 0.86);
+      border: 1px solid var(--border);
+    }
+
+    .signal-badge.buy { color: var(--green); }
+    .signal-badge.wait { color: var(--yellow); }
+    .signal-badge.sell { color: #ff9a9a; }
+    .signal-badge.skip { color: var(--red); }
+
+    .overlay-card {
+      background: rgba(7, 15, 28, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 14px 16px;
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
+    }
+
+    .overlay-card strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .overlay-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 13px;
+    }
+
+    .overlay-levels {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .overlay-level {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 10px 12px;
+    }
+
+    .overlay-level span {
+      display: block;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+
+    .overlay-level strong {
+      display: block;
+      font-size: 16px;
+      margin: 0;
+    }
+
+    .info-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      padding: 18px 24px 22px;
+      border-top: 1px solid var(--border);
+      background: rgba(6, 14, 24, 0.9);
+    }
+
+    .info-card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 18px;
+      padding: 14px 16px;
+      min-height: 108px;
+    }
+
+    .info-card span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+
+    .info-card strong {
+      display: block;
+      font-size: 20px;
+      margin-bottom: 8px;
+    }
+
+    .info-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .side {
+      display: grid;
+      gap: 20px;
+      align-content: start;
+    }
+
+    .side-section {
+      padding: 20px;
+    }
+
+    .side-section h2 {
+      margin: 0 0 6px;
+      font-size: 20px;
+    }
+
+    .side-section p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .status-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+
+    .pill {
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+    }
+
+    .pill.good { color: var(--green); }
+    .pill.warn { color: var(--yellow); }
+    .pill.bad { color: var(--red); }
+
+    .signal-list,
+    .history-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .signal-row,
+    .history-row {
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.07);
+      background: rgba(255,255,255,0.03);
+      padding: 14px 16px;
+    }
+
+    .signal-row header,
+    .history-row header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .signal-row strong,
+    .history-row strong {
+      font-size: 15px;
+    }
+
+    .mini-tag {
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      background: rgba(255,255,255,0.08);
+    }
+
+    .mini-tag.buy { color: var(--green); }
+    .mini-tag.wait { color: var(--yellow); }
+    .mini-tag.skip { color: var(--red); }
+
+    .signal-meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+      margin: 10px 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .signal-meta div strong {
+      display: block;
+      font-size: 15px;
+      color: var(--text);
+      margin-top: 2px;
+    }
+
+    .signal-row p,
+    .history-row p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .signal-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    .history-empty,
+    .signals-empty {
+      color: var(--muted);
+      padding: 14px 0 4px;
+    }
+
+    .footer-note {
+      padding: 14px 20px 20px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1180px) {
+      .page {
+        grid-template-columns: 1fr;
+      }
+      .toolbar {
+        grid-template-columns: 1fr 1fr;
+      }
+      .info-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 760px) {
+      .page {
+        padding: 14px;
+      }
+      .hero,
+      .toolbar,
+      .quick-bar,
+      .info-grid,
+      .side-section {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+      .hero {
+        flex-direction: column;
+      }
+      .toolbar {
+        grid-template-columns: 1fr;
+      }
+      .info-grid {
+        grid-template-columns: 1fr;
+      }
+      .chart-wrap {
+        min-height: 480px;
+      }
+      .chart-overlay {
+        max-width: calc(100% - 32px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="panel chart-panel">
+      <div class="hero">
+        <div>
+          <p class="eyebrow">Telescope</p>
+          <h1>Live Signal Telescope</h1>
+          <p>Open a live TradingView chart, scan the current symbol through your engine, and keep the entry, stop, targets, and action call pinned beside the candles.</p>
+        </div>
+        <div class="hero-actions">
+          <button class="ghost-btn" id="back-home" type="button">Back To Dashboard</button>
+          <button class="primary-btn" id="copy-plan" type="button">Copy Webull Plan</button>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <label class="field">
+          <span>Ticker</span>
+          <input id="ticker-input" type="text" value="NVDA" placeholder="NVDA, BTCUSD, ES=F">
+        </label>
+        <label class="field">
+          <span>Mode</span>
+          <select id="mode-select">
+            <option value="intraday">Intraday</option>
+            <option value="swing">Swing</option>
+            <option value="futures">Futures</option>
+            <option value="bitcoin">Bitcoin</option>
+            <option value="crypto">Crypto</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Auto Refresh</span>
+          <select id="refresh-select">
+            <option value="60000">Every 60 sec</option>
+            <option value="120000">Every 2 min</option>
+            <option value="0">Off</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Status</span>
+          <input id="status-readout" type="text" value="Ready" readonly>
+        </label>
+        <button class="scan-btn" id="scan-button" type="button">Scan Signals</button>
+      </div>
+
+      <div class="quick-bar" id="quick-bar">
+        <button type="button" data-ticker="NVDA" class="active">NVDA</button>
+        <button type="button" data-ticker="SPY">SPY</button>
+        <button type="button" data-ticker="QQQ">QQQ</button>
+        <button type="button" data-ticker="XLF">XLF</button>
+        <button type="button" data-ticker="BTCUSD">BTCUSD</button>
+        <button type="button" data-ticker="ETHUSD">ETHUSD</button>
+        <button type="button" data-ticker="ES=F">ES=F</button>
+        <button type="button" data-ticker="MES=F">MES=F</button>
+      </div>
+
+      <div class="chart-wrap">
+        <div class="chart-overlay">
+          <div class="signal-badge wait" id="overlay-action">WAIT</div>
+          <div class="overlay-card">
+            <strong id="overlay-title">Waiting on scan</strong>
+            <p id="overlay-reason">Run a live signal scan to pin the current setup, timing label, and risk plan beside the chart.</p>
+          </div>
+          <div class="overlay-levels">
+            <div class="overlay-level">
+              <span>Entry</span>
+              <strong id="overlay-entry">—</strong>
+            </div>
+            <div class="overlay-level">
+              <span>Stop</span>
+              <strong id="overlay-stop">—</strong>
+            </div>
+            <div class="overlay-level">
+              <span>Target 1</span>
+              <strong id="overlay-target1">—</strong>
+            </div>
+            <div class="overlay-level">
+              <span>Target 2</span>
+              <strong id="overlay-target2">—</strong>
+            </div>
+          </div>
+        </div>
+        <div id="tv-chart"></div>
+      </div>
+
+      <div class="info-grid">
+        <div class="info-card">
+          <span>Entry</span>
+          <strong id="entry-value">—</strong>
+          <p id="entry-note">Current trigger level</p>
+        </div>
+        <div class="info-card">
+          <span>Stop</span>
+          <strong id="stop-value">—</strong>
+          <p id="stop-note">Invalidation level</p>
+        </div>
+        <div class="info-card">
+          <span>Target 1 / 2</span>
+          <strong id="target-value">—</strong>
+          <p id="target-note">First and second objective</p>
+        </div>
+        <div class="info-card">
+          <span>Risk / Reward</span>
+          <strong id="rr-value">—</strong>
+          <p id="rr-note">Based on live execution plan</p>
+        </div>
+        <div class="info-card">
+          <span>Timing</span>
+          <strong id="timing-value">—</strong>
+          <p id="timing-note">Buy now, wait, or skip</p>
+        </div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="panel side-section">
+        <div class="status-row">
+          <span class="pill" id="system-pill">Checking engine</span>
+          <span class="pill" id="mode-pill">Mode: intraday</span>
+        </div>
+        <h2>Decision Box</h2>
+        <p id="decision-copy">No live signal yet. Load a ticker and scan to see the active decision, trend label, and execution plan.</p>
+        <div class="signal-actions">
+          <button class="ghost-btn" id="refresh-button" type="button">Refresh Current Signal</button>
+          <button class="ghost-btn" id="open-browser" type="button">Open Market Browser</button>
+        </div>
+      </section>
+
+      <section class="panel side-section">
+        <h2>Live Signal Stack</h2>
+        <p>Top matching signals for this symbol and mode. Click a row to reload the chart with that ticker.</p>
+        <div class="signal-list" id="signal-list">
+          <div class="signals-empty">No signal cards yet.</div>
+        </div>
+      </section>
+
+      <section class="panel side-section">
+        <h2>Signal History</h2>
+        <p>Recent Telescope scans stay here for quick review during the session.</p>
+        <div class="history-list" id="history-list">
+          <div class="history-empty">Nothing scanned yet.</div>
+        </div>
+      </section>
+
+      <section class="panel footer-note">
+        TradingView powers the chart canvas. Your own signal engine powers the decision box, signal stack, and execution details on the right.
+      </section>
+    </aside>
+  </div>
+
+  <script src="https://s3.tradingview.com/tv.js"></script>
+  <script>
+    const state = {
+      ticker: "NVDA",
+      mode: "intraday",
+      refreshMs: 60000,
+      widget: null,
+      timer: null,
+      currentSignal: null,
+      history: JSON.parse(localStorage.getItem("telescope-history") || "[]")
+    };
+
+    const tickerInput = document.querySelector("#ticker-input");
+    const modeSelect = document.querySelector("#mode-select");
+    const refreshSelect = document.querySelector("#refresh-select");
+    const statusReadout = document.querySelector("#status-readout");
+    const scanButton = document.querySelector("#scan-button");
+    const refreshButton = document.querySelector("#refresh-button");
+    const copyPlanButton = document.querySelector("#copy-plan");
+    const openBrowserButton = document.querySelector("#open-browser");
+    const backHomeButton = document.querySelector("#back-home");
+    const signalList = document.querySelector("#signal-list");
+    const historyList = document.querySelector("#history-list");
+    const quickBar = document.querySelector("#quick-bar");
+
+    function setStatus(text) {
+      statusReadout.value = text;
+    }
+
+    function normalizeTicker(input) {
+      return String(input || "").trim().toUpperCase().replace(/\s+/g, "");
+    }
+
+    function inferModeFromTicker(ticker) {
+      if (/=F$/.test(ticker)) return "futures";
+      if (ticker === "BTCUSD") return "bitcoin";
+      if (/USD$/.test(ticker)) return "crypto";
+      return state.mode || "intraday";
+    }
+
+    function toTradingViewSymbol(ticker) {
+      if (/=F$/.test(ticker)) return ticker;
+      if (ticker === "BTCUSD") return "BINANCE:BTCUSDT";
+      if (ticker === "ETHUSD") return "BINANCE:ETHUSDT";
+      if (ticker === "SOLUSD") return "BINANCE:SOLUSDT";
+      if (ticker === "XRPUSD") return "BINANCE:XRPUSDT";
+      if (ticker === "DOGEUSD") return "BINANCE:DOGEUSDT";
+      if (ticker === "ADAUSD") return "BINANCE:ADAUSDT";
+      if (ticker === "MATICUSD") return "BINANCE:POLUSDT";
+      if (ticker === "AVAXUSD") return "BINANCE:AVAXUSDT";
+      if (ticker === "LINKUSD") return "BINANCE:LINKUSDT";
+      if (ticker === "LTCUSD") return "BINANCE:LTCUSDT";
+      if (ticker === "SHIBUSD") return "BINANCE:SHIBUSDT";
+      return ticker;
+    }
+
+    function tradingViewInterval(mode) {
+      if (mode === "swing") return "240";
+      if (mode === "futures") return "60";
+      if (mode === "crypto" || mode === "bitcoin") return "60";
+      return "15";
+    }
+
+    function actionClassFromSignal(signal) {
+      const text = String(signal?.final_decision || signal?.action || "").toLowerCase();
+      const bias = String(signal?.bias || "").toLowerCase();
+      if ((text.includes("take") || text.includes("sell")) && (bias.includes("bear") || bias.includes("short") || bias.includes("sell"))) return "sell";
+      if (text.includes("take")) return "buy";
+      if (text.includes("skip")) return "skip";
+      return "wait";
+    }
+
+    function actionLabelFromSignal(signal) {
+      const text = String(signal?.final_decision || signal?.action || "").toLowerCase();
+      const bias = String(signal?.bias || "").toLowerCase();
+      if ((text.includes("take") || text.includes("sell")) && (bias.includes("bear") || bias.includes("short") || bias.includes("sell"))) return "SELL SHORT";
+      if (text.includes("take")) return "BUY NOW";
+      if (text.includes("skip")) return "SKIP";
+      return "WAIT";
+    }
+
+    function formatValue(value) {
+      return value == null || value === "" ? "—" : String(value);
+    }
+
+    function renderWidget() {
+      const symbol = toTradingViewSymbol(state.ticker);
+      document.querySelector("#tv-chart").innerHTML = "";
+      state.widget = new TradingView.widget({
+        autosize: true,
+        symbol,
+        interval: tradingViewInterval(state.mode),
+        timezone: "America/New_York",
+        theme: "dark",
+        style: "1",
+        locale: "en",
+        hide_top_toolbar: false,
+        hide_side_toolbar: false,
+        allow_symbol_change: true,
+        withdateranges: true,
+        studies: [
+          "MASimple@tv-basicstudies",
+          "MASimple@tv-basicstudies",
+          "VWAP@tv-basicstudies",
+          "RSI@tv-basicstudies",
+          "Volume@tv-basicstudies"
+        ],
+        container_id: "tv-chart"
+      });
+      updateQuickButtons();
+    }
+
+    function updateQuickButtons() {
+      quickBar.querySelectorAll("[data-ticker]").forEach((button) => {
+        button.classList.toggle("active", button.dataset.ticker === state.ticker);
+      });
+    }
+
+    function setOverlay(signal) {
+      const actionEl = document.querySelector("#overlay-action");
+      const titleEl = document.querySelector("#overlay-title");
+      const reasonEl = document.querySelector("#overlay-reason");
+      const entryEl = document.querySelector("#overlay-entry");
+      const stopEl = document.querySelector("#overlay-stop");
+      const target1El = document.querySelector("#overlay-target1");
+      const target2El = document.querySelector("#overlay-target2");
+      const timingValue = document.querySelector("#timing-value");
+      const timingNote = document.querySelector("#timing-note");
+      const decisionCopy = document.querySelector("#decision-copy");
+      const modePill = document.querySelector("#mode-pill");
+
+      if (!signal) {
+        actionEl.className = "signal-badge wait";
+        actionEl.textContent = "WAIT";
+        titleEl.textContent = "Waiting on scan";
+        reasonEl.textContent = "Run a live signal scan to pin the setup beside the chart.";
+        entryEl.textContent = "—";
+        stopEl.textContent = "—";
+        target1El.textContent = "—";
+        target2El.textContent = "—";
+        timingValue.textContent = "—";
+        timingNote.textContent = "No timing call yet";
+        decisionCopy.textContent = "No live signal yet. Load a ticker and scan to see the active decision, trend label, and execution plan.";
+        modePill.textContent = `Mode: ${state.mode}`;
+        return;
+      }
+
+      const actionClass = actionClassFromSignal(signal);
+      const actionLabel = actionLabelFromSignal(signal);
+      actionEl.className = `signal-badge ${actionClass}`;
+      actionEl.textContent = actionLabel;
+      titleEl.textContent = `${signal.ticker} · ${signal.trend_label || "Live setup"}`;
+      reasonEl.textContent = signal.momentum_reason || signal.reason || "Signal loaded.";
+      entryEl.textContent = formatValue(signal.entry || signal.execution_plan?.entry);
+      stopEl.textContent = formatValue(signal.stop || signal.execution_plan?.stop);
+      target1El.textContent = formatValue(signal.target1 || signal.execution_plan?.target1);
+      target2El.textContent = formatValue(signal.target2 || signal.execution_plan?.target2);
+      timingValue.textContent = signal.final_decision || signal.action || "watch";
+      timingNote.textContent = signal.invalid_if || "Confirm price action before execution.";
+      decisionCopy.textContent = `${actionLabel}. ${signal.momentum_reason || signal.reason || "Confirm the chart, then act on the entry and stop."} Entry ${formatValue(signal.entry || signal.execution_plan?.entry)}, stop ${formatValue(signal.stop || signal.execution_plan?.stop)}.`;
+      modePill.textContent = `Mode: ${signal.mode || state.mode}`;
+    }
+
+    function setDetailCards(signal) {
+      const plan = signal?.execution_plan || {};
+      document.querySelector("#entry-value").textContent = formatValue(signal?.entry || plan.entry);
+      document.querySelector("#entry-note").textContent = signal?.buy_trigger || "Current trigger level";
+      document.querySelector("#stop-value").textContent = formatValue(signal?.stop || plan.stop);
+      document.querySelector("#stop-note").textContent = signal?.invalid_if || "Invalidation level";
+      document.querySelector("#target-value").textContent = `${formatValue(signal?.target1 || plan.target1)} / ${formatValue(signal?.target2 || plan.target2)}`;
+      document.querySelector("#target-note").textContent = "Primary and stretch target";
+      const rr1 = plan.reward_risk_target1 ?? signal?.reward_to_risk_1;
+      const rr2 = plan.reward_risk_target2 ?? signal?.reward_to_risk_2;
+      document.querySelector("#rr-value").textContent = rr1 != null ? `${rr1}R / ${rr2 ?? "—"}R` : "—";
+      document.querySelector("#rr-note").textContent = plan.summary || "Based on live execution plan";
+    }
+
+    function renderSignalList(signals) {
+      if (!signals.length) {
+        signalList.innerHTML = `<div class="signals-empty">No matching live cards for ${state.ticker} in ${state.mode} right now.</div>`;
+        return;
+      }
+
+      signalList.innerHTML = signals.map((signal) => {
+        const tag = actionClassFromSignal(signal);
+        const label = actionLabelFromSignal(signal);
+        return `
+          <article class="signal-row" data-signal-ticker="${escapeHtml(signal.ticker)}" data-signal-mode="${escapeHtml(signal.mode || state.mode)}">
+            <header>
+              <strong>${escapeHtml(signal.ticker)}</strong>
+              <span class="mini-tag ${tag}">${escapeHtml(label)}</span>
+            </header>
+            <p>${escapeHtml(signal.trend_label || signal.momentum_reason || signal.reason || "Live signal")}</p>
+            <div class="signal-meta">
+              <div>Entry<strong>${escapeHtml(formatValue(signal.entry))}</strong></div>
+              <div>Stop<strong>${escapeHtml(formatValue(signal.stop))}</strong></div>
+              <div>Target 1<strong>${escapeHtml(formatValue(signal.target1))}</strong></div>
+              <div>Confidence<strong>${escapeHtml(formatValue(signal.confidence))}</strong></div>
+            </div>
+          </article>
+        `;
+      }).join("");
+
+      signalList.querySelectorAll("[data-signal-ticker]").forEach((row) => {
+        row.addEventListener("click", () => {
+          state.ticker = row.dataset.signalTicker;
+          state.mode = row.dataset.signalMode || inferModeFromTicker(state.ticker);
+          tickerInput.value = state.ticker;
+          modeSelect.value = state.mode;
+          renderWidget();
+          void runScan({ refresh: false });
+        });
+      });
+    }
+
+    function renderHistory() {
+      if (!state.history.length) {
+        historyList.innerHTML = `<div class="history-empty">Nothing scanned yet.</div>`;
+        return;
+      }
+      historyList.innerHTML = state.history.map((item) => `
+        <article class="history-row">
+          <header>
+            <strong>${escapeHtml(item.ticker)}</strong>
+            <span class="mini-tag ${escapeHtml(item.tag)}">${escapeHtml(item.action)}</span>
+          </header>
+          <p>${escapeHtml(item.reason)}</p>
+          <p style="margin-top:8px;">${escapeHtml(item.scannedAt)}</p>
+        </article>
+      `).join("");
+    }
+
+    function rememberSignal(signal) {
+      if (!signal) return;
+      const item = {
+        ticker: signal.ticker,
+        action: actionLabelFromSignal(signal),
+        tag: actionClassFromSignal(signal),
+        reason: signal.momentum_reason || signal.reason || "Signal captured",
+        scannedAt: new Date().toLocaleString()
+      };
+      state.history = [item, ...state.history.filter((entry) => !(entry.ticker === item.ticker && entry.scannedAt === item.scannedAt))].slice(0, 8);
+      localStorage.setItem("telescope-history", JSON.stringify(state.history));
+      renderHistory();
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Request failed with ${response.status}`);
+      }
+      return response.json();
+    }
+
+    async function scanModeSignals(mode) {
+      const data = await fetchJson(`/api/dashboard/signals?mode=${encodeURIComponent(mode)}`);
+      return Array.isArray(data?.signals) ? data.signals : [];
+    }
+
+    function pickSignalsForTicker(signals) {
+      const ticker = state.ticker;
+      const exact = signals.filter((signal) => String(signal.ticker || "").toUpperCase() === ticker);
+      if (exact.length) return exact;
+      return signals.slice(0, 5);
+    }
+
+    async function runScan(options = { refresh: true }) {
+      const ticker = normalizeTicker(tickerInput.value);
+      if (!ticker) return;
+      state.ticker = ticker;
+      state.mode = modeSelect.value || inferModeFromTicker(ticker);
+      setStatus("Scanning...");
+      scanButton.disabled = true;
+      refreshButton.disabled = true;
+      document.querySelector("#system-pill").textContent = "Engine busy";
+      document.querySelector("#system-pill").className = "pill warn";
+
+      try {
+        const query = new URLSearchParams({ ticker: state.ticker, mode: state.mode });
+        if (options.refresh) query.set("refresh", "1");
+        const chartSignal = await fetchJson(`/api/chart-signal?${query.toString()}`);
+        const signalPool = await scanModeSignals(state.mode);
+        const relatedSignals = pickSignalsForTicker(signalPool);
+        const activeSignal = chartSignal?.signal || relatedSignals[0] || null;
+        state.currentSignal = activeSignal;
+        renderWidget();
+        setOverlay(activeSignal);
+        setDetailCards(activeSignal);
+        renderSignalList(relatedSignals);
+        rememberSignal(activeSignal);
+        setStatus(activeSignal ? "Signal loaded" : "No live signal");
+        document.querySelector("#system-pill").textContent = activeSignal ? "Signal live" : "No signal";
+        document.querySelector("#system-pill").className = `pill ${activeSignal ? "good" : "warn"}`;
+      } catch (error) {
+        setStatus("Scan failed");
+        document.querySelector("#system-pill").textContent = "Signal error";
+        document.querySelector("#system-pill").className = "pill bad";
+        setOverlay(null);
+        document.querySelector("#overlay-title").textContent = "Scan failed";
+        document.querySelector("#overlay-reason").textContent = error.message || "Could not load signal.";
+        renderSignalList([]);
+      } finally {
+        scanButton.disabled = false;
+        refreshButton.disabled = false;
+      }
+    }
+
+    async function refreshOnly() {
+      return runScan({ refresh: false });
+    }
+
+    function scheduleRefresh() {
+      if (state.timer) clearInterval(state.timer);
+      if (!state.refreshMs) return;
+      state.timer = setInterval(() => { void refreshOnly(); }, state.refreshMs);
+    }
+
+    function updateRefreshMs() {
+      state.refreshMs = Number(refreshSelect.value || 0);
+      scheduleRefresh();
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    quickBar.querySelectorAll("[data-ticker]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.ticker = button.dataset.ticker || "NVDA";
+        state.mode = inferModeFromTicker(state.ticker);
+        tickerInput.value = state.ticker;
+        modeSelect.value = state.mode;
+        renderWidget();
+        void runScan({ refresh: false });
+      });
+    });
+
+    scanButton.addEventListener("click", () => { void runScan({ refresh: true }); });
+    refreshButton.addEventListener("click", () => { void refreshOnly(); });
+    copyPlanButton.addEventListener("click", async () => {
+      const plan = state.currentSignal?.webull_summary || state.currentSignal?.execution_plan?.summary;
+      if (!plan) return;
+      await navigator.clipboard.writeText(plan);
+      setStatus("Webull plan copied");
+    });
+    openBrowserButton.addEventListener("click", () => {
+      window.location.href = `/?ticker=${encodeURIComponent(state.ticker)}`;
+    });
+    backHomeButton.addEventListener("click", () => {
+      window.location.href = "/";
+    });
+
+    tickerInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void runScan({ refresh: true });
+      }
+    });
+
+    modeSelect.addEventListener("change", () => {
+      state.mode = modeSelect.value;
+      renderWidget();
+      void runScan({ refresh: false });
+    });
+
+    refreshSelect.addEventListener("change", updateRefreshMs);
+
+    renderHistory();
+    renderWidget();
+    updateRefreshMs();
+    void runScan({ refresh: false });
+  </script>
+</body>
+</html>

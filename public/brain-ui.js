@@ -140,6 +140,26 @@
       line-height: 1.65;
       white-space: pre-wrap;
     }
+    .brain-briefing-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .brain-briefing-actions button {
+      min-height: 40px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(165, 180, 252, 0.35);
+      background: rgba(99, 102, 241, 0.14);
+      color: #e0e7ff;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .brain-briefing-actions button:hover {
+      background: rgba(129, 140, 248, 0.22);
+    }
     #brain-briefing-banner .briefing-loading {
       color: #4f46e5;
       font-size: 12px;
@@ -314,11 +334,31 @@
       <button id="brain-briefing-dismiss" title="Dismiss">✕</button>
       <h4>📋 Today's Game Plan</h4>
       <div id="brain-briefing-text" class="briefing-loading">Loading morning briefing...</div>
+      <div class="brain-briefing-actions">
+        <button id="brain-open-home-plan" type="button">Open full game plan</button>
+        <button id="brain-open-buy-now" type="button">Open Buy Now</button>
+      </div>
     `;
     target.insertBefore(bannerEl, target.firstChild);
 
     document.getElementById("brain-briefing-dismiss").addEventListener("click", () => {
       bannerEl.remove();
+    });
+    document.getElementById("brain-open-home-plan")?.addEventListener("click", () => {
+      const homeNav = document.querySelector('[data-view="home"]');
+      if (homeNav) {
+        homeNav.click();
+      } else {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+      window.setTimeout(() => {
+        const matchingHeader = [...document.querySelectorAll(".panel-header h3")].find((node) => /today'?s game plan/i.test(node.textContent || ""));
+        matchingHeader?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 350);
+    });
+    document.getElementById("brain-open-buy-now")?.addEventListener("click", () => {
+      const buyNowNav = document.querySelector('[data-view="buynow"]');
+      if (buyNowNav) buyNowNav.click();
     });
 
     try {

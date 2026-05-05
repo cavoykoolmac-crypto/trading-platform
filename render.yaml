@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: trading-command-center
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: OPENAI_MODEL
+        value: gpt-5.4-mini
+      - key: AI_MODE
+        value: auto
+      - key: AUTO_SCAN_INTERVAL_MS
+        value: 180000
+      - key: DASHBOARD_SESSION_TIMEOUT_MS
+        value: 75000
+      - key: EXECUTION_ACCOUNT_SIZE
+        value: 10000
+      - key: EXECUTION_RISK_PCT
+        value: 0.5
+      - key: EXECUTION_MAX_POSITION_PCT
+        value: 20
+      - key: TRADE_IDEAS_PREMIUM_ONLY
+        value: "false"
+      - key: MOOMOO_HOST
+        value: 127.0.0.1
+      - key: MOOMOO_PORT
+        value: 11111
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: DASHBOARD_USERNAME
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false

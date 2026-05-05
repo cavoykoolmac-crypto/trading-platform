@@ -2,9 +2,21 @@ import http from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { URL } from "node:url";
+import { askBrain, getBrainStatus } from "./ai-brain.js";
+import {
+  getRealTimeQuote,
+  getCryptoTop10,
+  scoreSignalDualAI,
+  getPreMarketGappers,
+  getUnusualVolume,
+  getRankedMomentum,
+} from "./pro-upgrade.js";
 import { enrichCandidatesWithIndicators, buildSignalPromptInstructions } from "./signal-engine.js";
 import { shouldITakeThis, getExitAdvice, getMorningBriefing, injectNewsIntoCandidate, gradeTrade } from "./brain-upgrade.js";
+import { getMoomooQuote, getMoomooCandles, getMomooBatch, getMoomooStatus } from "./moomoo-bridge.js";
+import { getInciteSignals, refreshInciteSignals, startInciteSchedule } from "./incite-bridge.js";
 
 await loadDotEnv();
 
@@ -24,10 +36,19 @@ const EXECUTION_RISK_PCT = Number(process.env.EXECUTION_RISK_PCT || 0.5);
 const EXECUTION_MAX_POSITION_PCT = Number(process.env.EXECUTION_MAX_POSITION_PCT || 20);
 const DASHBOARD_USERNAME = process.env.DASHBOARD_USERNAME;
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
+const TRADE_IDEAS_ALERT_LOG = process.env.TRADE_IDEAS_ALERT_LOG || "";
+const TRADE_IDEAS_PREMIUM_ONLY = parseBoolean(process.env.TRADE_IDEAS_PREMIUM_ONLY ?? "true");
+const TRADE_IDEAS_TOPLIST_CONFIG = process.env.TRADE_IDEAS_TOPLIST_CONFIG
+  || "form=1&sort=MaxFCP&MinPrice=2&MinRV=0.5&MinTV=20000&MinVol5D=100000&X_NYSE=on&X_ARCA=on&X_AMEX=on&XN=on&EntireUniverse=2&SL_1_5=on&WN=Biggest+Gainers+(%25)&show0=D_Symbol&show1=Price&show2=FCD&show3=FCP&show4=TV&show5=RD&col_ver=1";
+const TRADE_IDEAS_SESSION_URL = process.env.TRADE_IDEAS_SESSION_URL || "https://www.trade-ideas.com/";
 const STORE_DIR = new URL("./data/", import.meta.url);
 const STORE_FILE = new URL("./data/events.json", import.meta.url);
 const JOURNAL_FILE = new URL("./data/journal.json", import.meta.url);
 const PUBLIC_DIR = new URL("./public/", import.meta.url);
+const TRADE_IDEAS_SESSION_FILE = new URL("./data/tradeideas-session.json", import.meta.url);
+const TRADE_IDEAS_RACE_URL = "https://www.trade-ideas.com/TIPro/stockracecentral/";
+const TRADE_IDEAS_META_URL = "https://www.trade-ideas.com/TIPro/controllers/top_list_meta_data.php";
+const TRADE_IDEAS_DATA_URL = "https://www.trade-ideas.com/TIPro/controllers/top_list_data_feed.php";
 const INDEX_SYMBOLS = {
   SPX: {
     providerSymbol: "^SPX",
@@ -215,11 +236,11 @@ const SCAN_MODES = {
   }
 };
 const ROTATING_SCAN_BATCH_SIZE = 20;
-const FINNHUB_REQUEST_BATCH_SIZE = 5;
-const SCAN_BATCH_DELAY_MS = 750;
-const FINNHUB_REQUEST_DELAY_MS = 125;
+const FINNHUB_REQUEST_BATCH_SIZE = 10;
+const SCAN_BATCH_DELAY_MS = 200;
+const FINNHUB_REQUEST_DELAY_MS = 0;
 const AI_CANDIDATE_LIMIT = 10;
-const SCAN_CACHE_TTL_MS = 60_000;
+const SCAN_CACHE_TTL_MS = 120_000;
 const NEWS_CACHE_TTL_MS = 300_000;
 const NEWS_SYMBOL_LIMIT = 8;
 const NEWS_PER_SYMBOL_LIMIT = 4;
@@ -227,7 +248,7 @@ const MARKET_NEWS_LIMIT = 20;
 const AUTO_SCAN_INTERVAL_MS = Number(process.env.AUTO_SCAN_INTERVAL_MS || 180_000);
 const DASHBOARD_SESSION_TIMEOUT_MS = Number(process.env.DASHBOARD_SESSION_TIMEOUT_MS || 75_000);
 const DASHBOARD_SESSION_SWEEP_MS = 15_000;
-const AUTO_SCAN_MODE_SEQUENCE = ["swing", "all"];
+const AUTO_SCAN_MODE_SEQUENCE = ["intraday", "swing"];
 const MARKET_COVERAGE = [
   "US large-cap indexes",
   "US small/mid-cap indexes",
@@ -316,6 +337,15 @@ const INTERTRADE_MIN_CONFIDENCE = 6;
 const INTERTRADE_MAX_ENTRY_DISTANCE_PCT = 0.9;
 const INTERTRADE_MAX_STOP_PCT = 2;
 const INTERTRADE_MAX_RESULTS = 5;
+const TRADE_IDEAS_BRAIN_CACHE_TTL_MS = 90 * 1000;
+
+let tradeIdeasBrainCache = {
+  data: null,
+  cachedAt: 0,
+  key: "",
+  status: "idle",
+  error: null
+};
 
 const state = {
   events: await loadEvents(),
@@ -361,6 +391,74 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
+    if (req.method === "GET" && url.pathname === "/api/incite/signals") {
+      const prompt = url.searchParams.get("prompt") || undefined;
+      return sendJson(res, 200, await getInciteSignals(prompt));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/incite/refresh") {
+      const rawBody = await readBody(req);
+      const { prompt } = parsePayload(rawBody);
+      return sendJson(res, 200, await refreshInciteSignals(prompt));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/moomoo/quote") {
+      const symbol = url.searchParams.get("symbol") || "AAPL";
+      return sendJson(res, 200, await getMoomooQuote(symbol.toUpperCase()));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/moomoo/candles") {
+      const symbol = url.searchParams.get("symbol") || "AAPL";
+      const interval = url.searchParams.get("interval") || "5";
+      return sendJson(res, 200, await getMoomooCandles(symbol.toUpperCase(), interval));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/moomoo/batch") {
+      const symbols = (url.searchParams.get("symbols") || "AAPL,NVDA,SPY").split(",");
+      return sendJson(res, 200, await getMomooBatch(symbols));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/moomoo/status") {
+      return sendJson(res, 200, await getMoomooStatus());
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/brain/ask") {
+      const body = await readBody(req);
+      const { prompt, context, mode } = parsePayload(body);
+      return sendJson(res, 200, await askBrain(prompt, context, mode));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/brain/status") {
+      return sendJson(res, 200, getBrainStatus());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/pro/quote") {
+      const symbol = url.searchParams.get("symbol") || "AAPL";
+      return sendJson(res, 200, await getRealTimeQuote(symbol.toUpperCase()));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/pro/crypto") {
+      return sendJson(res, 200, await getCryptoTop10());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/pro/gappers") {
+      return sendJson(res, 200, await getPreMarketGappers());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/pro/volume") {
+      return sendJson(res, 200, await getUnusualVolume());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/pro/momentum") {
+      return sendJson(res, 200, await getRankedMomentum());
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/pro/score") {
+      const body = await readBody(req);
+      const signal = parsePayload(body);
+      return sendJson(res, 200, await scoreSignalDualAI(signal));
+    }
+
     if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/health") {
       return sendJson(res, 200, { ok: true, status: "running" }, { headOnly: req.method === "HEAD" });
     }
@@ -371,6 +469,12 @@ const server = http.createServer(async (req, res) => {
 
     if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/") {
       return sendHtml(res, renderTradingPlatform(), { headOnly: req.method === "HEAD" });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/telescope") {
+      const file = await readFile(new URL("./public/telescope.html", import.meta.url));
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return req.method === "HEAD" ? res.end() : res.end(file);
     }
 
     if ((req.method === "GET" || req.method === "HEAD") && url.pathname.startsWith("/public/")) {
@@ -436,6 +540,32 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, getDashboardAlerts());
     }
 
+    if (req.method === "GET" && url.pathname === "/api/trade-ideas/alerts") {
+      return sendJson(res, 200, await getTradeIdeasAlerts(url.searchParams));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/trade-ideas/status") {
+      return sendJson(res, 200, await getTradeIdeasStatus());
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/trade-ideas/refresh") {
+      tradeIdeasBrainCache = { data: null, cachedAt: 0, key: "", status: "idle", error: null };
+      return sendJson(res, 200, await getTradeIdeasAlerts(new URLSearchParams()));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/trade-ideas/analyze-latest") {
+      tradeIdeasBrainCache = { data: null, cachedAt: 0, key: "", status: "idle", error: null };
+      return sendJson(res, 200, await getTradeIdeasBrain(new URLSearchParams({ mode: "intraday", refresh: "1" })));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/trade-ideas/start-session") {
+      return sendJson(res, 200, await startTradeIdeasSessionSaver());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/trade-ideas/brain") {
+      return sendJson(res, 200, await getTradeIdeasBrain(url.searchParams));
+    }
+
     if (req.method === "GET" && url.pathname === "/api/dashboard/news") {
       return sendJson(res, 200, await getDashboardNews(getOptionalMode(url), shouldRefreshScan(url)));
     }
@@ -446,6 +576,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/chart-signal") {
       return sendJson(res, 200, await getChartSignal(url.searchParams.get("ticker"), getOptionalMode(url), shouldRefreshScan(url)));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/chart-signals") {
+      return sendJson(res, 200, await getChartSignals(url.searchParams.get("ticker"), getOptionalMode(url), shouldRefreshScan(url)));
     }
 
     if (req.method === "GET" && url.pathname === "/api/dashboard/execution") {
@@ -621,6 +755,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/auto-scan/start") {
       startAutoScan();
+      startInciteSchedule();
       if (wantsHtml(req)) return redirect(res, "/scan");
       return sendJson(res, 200, getAutoScanStatus());
     }
@@ -804,6 +939,7 @@ async function startDashboardSession(payload = {}) {
 
   startDashboardSessionSweeper();
   startAutoScan();
+  startInciteSchedule();
 
   maybeKickoffSwingScan("website-open");
 
@@ -848,8 +984,9 @@ function heartbeatDashboardSession(payload = {}) {
 
 function maybeKickoffSwingScan(source = "website-online") {
   const lastRunMs = Date.parse(state.autoScan.lastRunAt || "");
-  const shouldRunSwingKickoff = !state.autoScan.running && (!lastRunMs || Date.now() - lastRunMs > SCAN_CACHE_TTL_MS);
-  if (shouldRunSwingKickoff) {
+  const THREE_MINUTES = 180_000;
+  const shouldRun = !state.autoScan.running && (!lastRunMs || Date.now() - lastRunMs > THREE_MINUTES);
+  if (shouldRun) {
     void runAutoScanNow(source, "swing");
   }
 }
@@ -1292,12 +1429,7 @@ async function fetchFinnhubQuotesBatched(symbols) {
 
   for (let index = 0; index < symbols.length; index += FINNHUB_REQUEST_BATCH_SIZE) {
     const batch = symbols.slice(index, index + FINNHUB_REQUEST_BATCH_SIZE);
-    const batchQuotes = [];
-
-    for (const symbol of batch) {
-      batchQuotes.push(await fetchFinnhubQuote(symbol));
-      await sleep(FINNHUB_REQUEST_DELAY_MS);
-    }
+    const batchQuotes = await Promise.all(batch.map((symbol) => fetchFinnhubQuote(symbol)));
 
     quotes.push(...batchQuotes);
 
@@ -1616,14 +1748,78 @@ function addSessionPriceFields(quote) {
 }
 
 async function analyzeScanWithOpenAI(rankedQuotes, request) {
+  const aiMode = process.env.AI_MODE || "auto";
+  let responseText = "";
+
+  if (aiMode === "collab") {
+    const [claudeRes, gptRes] = await Promise.allSettled([
+      askBrain(
+        buildSignalPromptInstructions(request).join(" "),
+        JSON.stringify(rankedQuotes, null, 2),
+        "claude"
+      ),
+      callOpenAI({
+        instructions: buildSignalPromptInstructions(request).join(" "),
+        input: JSON.stringify(rankedQuotes, null, 2),
+        maxOutputTokens: 1400,
+        errorLabel: "GPT scan"
+      }),
+    ]);
+
+    if (gptRes.status === "fulfilled") {
+      responseText = extractResponseText(gptRes.value);
+    } else if (claudeRes.status === "fulfilled") {
+      responseText = claudeRes.value.response || "";
+    }
+  } else {
+    const brainResult = await askBrain(
+      buildSignalPromptInstructions(request).join(" "),
+      JSON.stringify(rankedQuotes, null, 2),
+      aiMode
+    );
+    responseText = brainResult.response || "";
+  }
+
+  return parseJsonSignals(responseText, rankedQuotes, request);
+}
+
+async function analyzeTradeIdeasWithOpenAI(candidates, request) {
+  const trimmedCandidates = candidates.slice(0, 10).map((candidate) => ({
+    ticker: candidate.symbol,
+    price: candidate.current,
+    change_percent: candidate.changePercent,
+    volume: candidate.volume,
+    volume_ratio: candidate.volumeRatio ?? candidate.rel_volume ?? null,
+    range_position: candidate.rangePosition,
+    score: candidate.score,
+    trade_ideas: candidate.trade_ideas || null,
+    indicators: candidate.indicators || null,
+    recent_news: candidate.injected_news || []
+  }));
+  const instructions = [
+    "You are the intraday ChatGPT brain for a Trade Ideas driven trading dashboard.",
+    "The candidates already came from Trade Ideas alerts and biggest gainers.",
+    "Return strict JSON only as an array. No markdown. No prose outside JSON.",
+    "Return up to 6 objects with exactly these keys:",
+    "ticker, bias, entry, stop, target1, target2, confidence, reason, invalid_if, buy_trigger, sell_trigger, bull_run_flag, hold_window, setup_score, momentum_score, trend_label, momentum_reason, signal_type.",
+    "signal_type must always be strict_take.",
+    "Use the indicators field. Do not invent indicator values.",
+    "If a setup is actionable now, use bias bullish or bearish and confidence 6-9.",
+    "If a setup is close but not ready, use bias watch and confidence 4-6.",
+    "If the setup is weak, omit it entirely rather than returning junk.",
+    "Entry, stop, and targets must be numeric-looking price strings.",
+    "For bullish ideas, target1 must be above entry and stop below entry.",
+    "For bearish ideas, target1 must be below entry and stop above entry.",
+    "Favor names with strong Trade Ideas change, strong range position, clean momentum, and usable reward/risk."
+  ].join(" ");
   const data = await callOpenAI({
-    instructions: buildSignalPromptInstructions(request).join(" "),
-    input: JSON.stringify(rankedQuotes, null, 2),
-    maxOutputTokens: 1400,
-    errorLabel: "OpenAI scan analysis"
+    instructions,
+    input: JSON.stringify(trimmedCandidates, null, 2),
+    maxOutputTokens: 1200,
+    errorLabel: "Trade Ideas OpenAI analysis"
   });
 
-  return parseJsonSignals(extractResponseText(data), rankedQuotes, request);
+  return parseJsonSignals(extractResponseText(data), candidates, request);
 }
 
 async function callOpenAI({ instructions, input, maxOutputTokens = 700, errorLabel = "OpenAI request" }) {
@@ -2232,6 +2428,333 @@ function getDashboardAlerts() {
   };
 }
 
+async function getTradeIdeasAlerts(params = new URLSearchParams()) {
+  const limit = Math.max(1, Math.min(250, Number(params.get("limit")) || 80));
+  const premiumOnly = TRADE_IDEAS_PREMIUM_ONLY;
+  if (premiumOnly) {
+    const premiumSource = await loadTradeIdeasPremiumSource(limit);
+    if (!premiumSource.ok) {
+      return {
+        ok: false,
+        connected: false,
+        createdAt: new Date().toISOString(),
+        source: "trade_ideas_premium_only",
+        premium_only: true,
+        configured_path: TRADE_IDEAS_ALERT_LOG || null,
+        searched_paths: getTradeIdeasLogCandidates(),
+        session_file_exists: existsSync(TRADE_IDEAS_SESSION_FILE),
+        alerts: [],
+        leaders: [],
+        error: premiumSource.error || "Premium Trade Ideas is not connected yet.",
+        next_step: premiumSource.next_step || "Log in through the Trade Ideas session saver or set TRADE_IDEAS_ALERT_LOG."
+      };
+    }
+
+    return {
+      ok: true,
+      connected: true,
+      createdAt: new Date().toISOString(),
+      source: premiumSource.source,
+      premium_only: true,
+      race_url: TRADE_IDEAS_RACE_URL,
+      log_path: premiumSource.log_path || null,
+      session_file_exists: existsSync(TRADE_IDEAS_SESSION_FILE),
+      count: premiumSource.alerts.length,
+      alerts: premiumSource.alerts,
+      leaders: buildTradeIdeasLeaders(premiumSource.alerts),
+      headers: premiumSource.headers || [],
+      updated_at: premiumSource.updated_at || premiumSource.alerts[0]?.timestamp || null,
+      title: premiumSource.title || "Trade Ideas Premium Feed"
+    };
+  }
+
+  const webFeed = await loadTradeIdeasWebFeed();
+  if (webFeed.ok) {
+    const alerts = webFeed.alerts.slice(0, limit);
+    return {
+      ok: true,
+      connected: true,
+      createdAt: new Date().toISOString(),
+      source: "trade_ideas_webfeed",
+      premium_only: false,
+      race_url: TRADE_IDEAS_RACE_URL,
+      config: TRADE_IDEAS_TOPLIST_CONFIG,
+      count: webFeed.alerts.length,
+      alerts,
+      leaders: buildTradeIdeasLeaders(webFeed.alerts),
+      headers: webFeed.headers,
+      updated_at: alerts[0]?.timestamp || null,
+      title: webFeed.title || "Trade Ideas Top List"
+    };
+  }
+
+  const source = await loadTradeIdeasSource();
+  if (!source.ok) {
+    return {
+      ok: false,
+      connected: false,
+      createdAt: new Date().toISOString(),
+      source: "trade_ideas_webfeed",
+      premium_only: false,
+      race_url: TRADE_IDEAS_RACE_URL,
+      configured_path: TRADE_IDEAS_ALERT_LOG || null,
+      searched_paths: getTradeIdeasLogCandidates(),
+      alerts: [],
+      leaders: [],
+      error: webFeed.error || source.error,
+      next_step: "Trade Ideas web feed was unavailable. Set TRADE_IDEAS_ALERT_LOG to your alert log CSV, or drop a CSV into ./data/trade-ideas-alerts.csv."
+    };
+  }
+
+  const parsed = parseTradeIdeasCsv(source.text);
+  const alerts = parsed.alerts.slice(0, limit);
+  const leaders = buildTradeIdeasLeaders(parsed.alerts);
+
+  return {
+    ok: true,
+    connected: true,
+    createdAt: new Date().toISOString(),
+    source: "trade_ideas_csv",
+    premium_only: false,
+    race_url: TRADE_IDEAS_RACE_URL,
+    log_path: source.path,
+    count: parsed.alerts.length,
+    alerts,
+    leaders,
+    headers: parsed.headers,
+    updated_at: parsed.alerts[0]?.timestamp || null
+  };
+}
+
+async function getTradeIdeasBrain(params = new URLSearchParams()) {
+  const mode = normalizeMode(params.get("mode") || "intraday");
+  const limit = Math.max(4, Math.min(40, Number(params.get("limit")) || 18));
+  const refresh = ["1", "true", "yes"].includes(String(params.get("refresh") || "").toLowerCase());
+  const cacheKey = `${mode}:${limit}`;
+  const now = Date.now();
+
+  if (!refresh && tradeIdeasBrainCache.data && tradeIdeasBrainCache.key === cacheKey && now - tradeIdeasBrainCache.cachedAt < TRADE_IDEAS_BRAIN_CACHE_TTL_MS) {
+    return {
+      ...tradeIdeasBrainCache.data,
+      cache: {
+        hit: true,
+        ageSeconds: Math.round((now - tradeIdeasBrainCache.cachedAt) / 1000)
+      }
+    };
+  }
+
+  const feed = await getTradeIdeasAlerts(new URLSearchParams({ limit: String(Math.max(limit * 3, 40)) }));
+  if (!feed.ok || !feed.connected) {
+    return {
+      ok: false,
+      connected: false,
+      createdAt: new Date().toISOString(),
+      mode,
+      source: "trade_ideas_brain",
+      premium_only: Boolean(feed.premium_only),
+      signals: [],
+      plans: [],
+      intertrade_plans: [],
+      alerts: feed.alerts || [],
+      leaders: feed.leaders || [],
+      error: feed.error || "Trade Ideas feed unavailable.",
+      next_step: feed.next_step || "Reconnect Trade Ideas first."
+    };
+  }
+
+  tradeIdeasBrainCache.status = "fetching";
+  tradeIdeasBrainCache.error = null;
+  const createdAt = new Date().toISOString();
+
+  try {
+    const request = {
+      symbols: [],
+      mode,
+      modeConfig: SCAN_MODES[mode] || SCAN_MODES.intraday,
+      refresh,
+      universeSize: feed.count || feed.alerts.length,
+      batchNumber: 1,
+      batchTotal: 1,
+      batchStart: 1,
+      batchEnd: Math.min(limit, feed.alerts.length),
+      rotating: false,
+      cacheKey: `tradeideas:${mode}:${limit}`,
+      createdAt
+    };
+
+    const candidates = await buildTradeIdeasBrainCandidates(feed.alerts || [], limit, mode);
+    if (!candidates.length) {
+      const empty = {
+        ok: true,
+        connected: true,
+        createdAt,
+        mode,
+        source: "trade_ideas_brain",
+        premium_only: Boolean(feed.premium_only),
+        title: `${feed.title || "Trade Ideas"} + ChatGPT Brain`,
+        count: 0,
+        candidate_count: 0,
+        alerts: feed.alerts || [],
+        leaders: feed.leaders || [],
+        signals: [],
+        plans: [],
+        intertrade_plans: [],
+        top_take_signals: [],
+        watch_signals: [],
+        market_regime: state.marketRegime,
+        error: "Trade Ideas returned names, but none had enough live price data to score yet.",
+        cache: { hit: false, ageSeconds: 0 }
+      };
+      tradeIdeasBrainCache = {
+        data: empty,
+        cachedAt: now,
+        key: cacheKey,
+        status: "ok",
+        error: null
+      };
+      return empty;
+    }
+
+    const enrichedCandidates = await enrichCandidatesWithIndicators(candidates, FINNHUB_API_KEY);
+    for (const candidate of enrichedCandidates) {
+      await injectNewsIntoCandidate(candidate, FINNHUB_API_KEY);
+    }
+
+    const strictSignals = isConfiguredKey(OPENAI_API_KEY, "your_openai_api_key_here")
+      ? await analyzeTradeIdeasWithOpenAI(enrichedCandidates, request)
+      : parseJsonSignals("[]", enrichedCandidates, request);
+    const momentumSignals = buildMomentumSignals(enrichedCandidates, strictSignals, request);
+    const mergedSignals = mergeSignalsByVariant([...strictSignals, ...momentumSignals]);
+    const annotatedSignals = annotateSignalChanges(mergedSignals, request);
+    const signals = attachTradeIdeasBrainContext(sortSignalsForDashboard(annotatedSignals, "quality"), enrichedCandidates);
+    const plans = dedupeTradeIdeasPlans(signals.map((signal) => signal.execution_plan).filter(Boolean));
+    const intertradePlans = plans.filter((plan) => plan.buy_now_type === "intertrade_take").slice(0, 5);
+    const topTakeSignals = signals.filter((signal) => signal.final_decision === "take").slice(0, 8);
+    const watchSignals = signals.filter((signal) => signal.final_decision === "watch").slice(0, 8);
+
+    const payload = {
+      ok: true,
+      connected: true,
+      createdAt,
+      mode,
+      source: "trade_ideas_brain",
+      premium_only: Boolean(feed.premium_only),
+      title: `${feed.title || "Trade Ideas"} + ChatGPT Brain`,
+      count: signals.length,
+      candidate_count: enrichedCandidates.length,
+      alerts: feed.alerts || [],
+      leaders: feed.leaders || [],
+      signals,
+      plans,
+      intertrade_plans: intertradePlans,
+      top_take_signals: topTakeSignals,
+      watch_signals: watchSignals,
+      market_regime: state.marketRegime,
+      headers: feed.headers || [],
+      updated_at: feed.updated_at || feed.alerts?.[0]?.timestamp || createdAt,
+      race_url: feed.race_url || TRADE_IDEAS_RACE_URL,
+      chatgpt_brain: {
+        connected: isConfiguredKey(OPENAI_API_KEY, "your_openai_api_key_here"),
+        model: OPENAI_MODEL
+      },
+      cache: {
+        hit: false,
+        ageSeconds: 0
+      }
+    };
+
+    tradeIdeasBrainCache = {
+      data: payload,
+      cachedAt: now,
+      key: cacheKey,
+      status: "ok",
+      error: null
+    };
+    return payload;
+  } catch (error) {
+    tradeIdeasBrainCache.status = "error";
+    tradeIdeasBrainCache.error = error.message || "Trade Ideas brain failed.";
+    return {
+      ok: false,
+      connected: true,
+      createdAt,
+      mode,
+      source: "trade_ideas_brain",
+      premium_only: Boolean(feed.premium_only),
+      alerts: feed.alerts || [],
+      leaders: feed.leaders || [],
+      signals: [],
+      plans: [],
+      intertrade_plans: [],
+      error: tradeIdeasBrainCache.error
+    };
+  }
+}
+
+async function getTradeIdeasStatus() {
+  const csvSource = await loadTradeIdeasSource();
+  if (csvSource.ok) {
+    const parsed = parseTradeIdeasCsv(csvSource.text);
+    return {
+      premium_only: TRADE_IDEAS_PREMIUM_ONLY,
+      connected: true,
+      source: "alert_log",
+      last_seen_at: parsed.alerts[0]?.timestamp || null,
+      message: `Premium Trade Ideas alert log connected at ${csvSource.path}.`,
+      configured_path: csvSource.path,
+      session_file_exists: existsSync(TRADE_IDEAS_SESSION_FILE),
+      last_tickers: parsed.alerts.slice(0, 8).map((alert) => alert.ticker)
+    };
+  }
+
+  const sessionStatus = await getTradeIdeasSessionStatus();
+  if (sessionStatus.connected) {
+    return {
+      premium_only: TRADE_IDEAS_PREMIUM_ONLY,
+      connected: true,
+      source: sessionStatus.source,
+      last_seen_at: sessionStatus.last_seen_at,
+      message: sessionStatus.message,
+      configured_path: TRADE_IDEAS_ALERT_LOG || null,
+      session_file_exists: true,
+      last_tickers: sessionStatus.last_tickers || []
+    };
+  }
+
+  return {
+    premium_only: TRADE_IDEAS_PREMIUM_ONLY,
+    connected: false,
+    source: "none",
+    last_seen_at: null,
+    message: sessionStatus.message || "Premium Trade Ideas is not connected yet. Log in or set TRADE_IDEAS_ALERT_LOG.",
+    configured_path: TRADE_IDEAS_ALERT_LOG || null,
+    session_file_exists: existsSync(TRADE_IDEAS_SESSION_FILE),
+    last_tickers: []
+  };
+}
+
+async function startTradeIdeasSessionSaver() {
+  try {
+    const child = spawn(process.execPath, ["tradeideas-session.js"], {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    return {
+      ok: true,
+      started: true,
+      message: "Trade Ideas session saver launched. Finish login in the browser window, then return to the app."
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      started: false,
+      message: error.message || "Could not start Trade Ideas session saver."
+    };
+  }
+}
+
 async function getDashboardNews(mode = null, refresh = false) {
   const symbols = parseNewsSymbols(null, mode);
   const companyNews = await getLatestNews(symbols, refresh);
@@ -2313,6 +2836,7 @@ async function getChartSignal(tickerValue, mode = null, refresh = false) {
   const signal = signals[0] || null;
   const executionPlan = getBestExecutionPlanForTicker(getExecutionPlans(mode).plans, ticker);
   const levels = buildChartOverlayLevels(signal, quote);
+  const chartSignals = buildChartSignals(signal, executionPlan, quote);
 
   return {
     ok: true,
@@ -2321,6 +2845,7 @@ async function getChartSignal(tickerValue, mode = null, refresh = false) {
     mode: signal?.signal_mode || signal?.mode || mode || inferSourceMode(ticker),
     asset_class: signal?.asset_class || inferAssetClass(ticker),
     quote,
+    current_price: Number.isFinite(Number(quote?.current)) ? Number(quote.current) : null,
     has_signal: Boolean(signal),
     signal_message: signal ? "Active signal overlay loaded." : "No active signal overlay for this ticker.",
     signal: signal
@@ -2354,9 +2879,11 @@ async function getChartSignal(tickerValue, mode = null, refresh = false) {
         }
       : null,
     execution_plan: executionPlan,
+    signals: chartSignals,
     levels,
     chart_range: getChartOverlayRange(quote, levels),
     legend: [
+      ...chartSignals.map((item) => ({ key: item.key || item.type.toLowerCase(), label: item.label, color: item.tone || item.type.toLowerCase() })),
       { key: "entry", label: "Entry", color: "green" },
       { key: "stop", label: "Stop", color: "red" },
       { key: "target1", label: "Target 1", color: "yellow" },
@@ -2364,6 +2891,10 @@ async function getChartSignal(tickerValue, mode = null, refresh = false) {
       { key: "sell_trigger", label: "Sell trigger", color: "orange" }
     ]
   };
+}
+
+async function getChartSignals(tickerValue, mode = null, refresh = false) {
+  return getChartSignal(tickerValue, mode, refresh);
 }
 
 function getDashboardExecution(mode = null) {
@@ -2421,7 +2952,11 @@ function getDashboardSettings() {
     delivery: getDeliveryStatus(),
     auto_scan: getAutoScanStatus(),
     dashboard_session: getDashboardSessionStatus(),
-    universe: getUniverseSummary()
+    universe: getUniverseSummary(),
+    trade_ideas: {
+      configured_path: TRADE_IDEAS_ALERT_LOG || null,
+      race_url: TRADE_IDEAS_RACE_URL
+    }
   };
 }
 
@@ -2467,6 +3002,659 @@ function sortSignalsForDashboard(signals, sort) {
   if (sort === "mode") return copy.sort((a, b) => String(a.signal_mode || a.mode).localeCompare(String(b.signal_mode || b.mode)));
   if (sort === "ticker") return copy.sort((a, b) => String(a.ticker || "").localeCompare(String(b.ticker || "")));
   return copy.sort((a, b) => Number(b.final_quality_score || 0) - Number(a.final_quality_score || 0));
+}
+
+function getTradeIdeasLogCandidates() {
+  const home = process.env.HOME || "";
+  const candidates = [
+    TRADE_IDEAS_ALERT_LOG,
+    `${process.cwd()}/data/trade-ideas-alerts.csv`,
+    `${home}/Documents/TradeIdeasPro/alerts.csv`,
+    `${home}/Documents/Trade Ideas/alerts.csv`,
+    `${home}/Documents/TradeIdeas/alerts.csv`,
+    `${home}/Desktop/trade-ideas-alerts.csv`
+  ].filter(Boolean);
+  return [...new Set(candidates)];
+}
+
+async function loadTradeIdeasSource() {
+  for (const path of getTradeIdeasLogCandidates()) {
+    if (!path || !existsSync(path)) continue;
+    try {
+      const text = await readFile(path, "utf8");
+      if (text.trim()) return { ok: true, path, text };
+    } catch {}
+  }
+  return {
+    ok: false,
+    error: "Trade Ideas alert log not found yet."
+  };
+}
+
+async function loadTradeIdeasPremiumSource(limit = 80) {
+  const csvSource = await loadTradeIdeasSource();
+  if (csvSource.ok) {
+    const parsed = parseTradeIdeasCsv(csvSource.text);
+    return {
+      ok: true,
+      source: "alert_log",
+      log_path: csvSource.path,
+      alerts: parsed.alerts.slice(0, limit),
+      headers: parsed.headers,
+      updated_at: parsed.alerts[0]?.timestamp || null,
+      title: "Trade Ideas Premium Alert Log"
+    };
+  }
+
+  const sessionSource = await loadTradeIdeasSessionAlerts(limit);
+  if (sessionSource.ok) return sessionSource;
+
+  return {
+    ok: false,
+    source: "none",
+    error: sessionSource.error || "Premium Trade Ideas is not connected yet.",
+    next_step: sessionSource.next_step || "Run the Trade Ideas session saver or configure TRADE_IDEAS_ALERT_LOG."
+  };
+}
+
+async function getTradeIdeasSessionStatus() {
+  if (!existsSync(TRADE_IDEAS_SESSION_FILE)) {
+    return {
+      connected: false,
+      source: "none",
+      message: "No saved Trade Ideas session found yet. Run the session saver first."
+    };
+  }
+
+  const source = await loadTradeIdeasSessionAlerts(12);
+  if (!source.ok) {
+    return {
+      connected: false,
+      source: "session",
+      last_seen_at: null,
+      message: source.error || "Trade Ideas login expired. Reconnect."
+    };
+  }
+
+  return {
+    connected: true,
+    source: "session",
+    last_seen_at: source.updated_at || source.alerts[0]?.timestamp || null,
+    message: "Saved Trade Ideas premium session is connected.",
+    last_tickers: source.alerts.slice(0, 8).map((alert) => alert.ticker)
+  };
+}
+
+async function loadTradeIdeasSessionAlerts(limit = 80) {
+  if (!existsSync(TRADE_IDEAS_SESSION_FILE)) {
+    return {
+      ok: false,
+      source: "session",
+      error: "Trade Ideas session file not found.",
+      next_step: "Run node tradeideas-session.js and log in manually."
+    };
+  }
+
+  let chromiumModule;
+  try {
+    chromiumModule = await import("playwright");
+  } catch {
+    return {
+      ok: false,
+      source: "session",
+      error: "Playwright is not installed for Trade Ideas session support.",
+      next_step: "Install Playwright and Chromium, then run node tradeideas-session.js."
+    };
+  }
+
+  const storageState = await readFile(TRADE_IDEAS_SESSION_FILE, "utf8").then((text) => safeJsonParse(text)).catch(() => null);
+  if (!storageState) {
+    return {
+      ok: false,
+      source: "session",
+      error: "Trade Ideas session file is unreadable.",
+      next_step: "Run node tradeideas-session.js again."
+    };
+  }
+
+  let browser;
+  try {
+    browser = await chromiumModule.chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    });
+    const context = await browser.newContext({ storageState });
+    const page = await context.newPage();
+    await page.goto(TRADE_IDEAS_SESSION_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(2000);
+    const snapshot = await extractTradeIdeasSessionSnapshot(page);
+    if (!snapshot.alerts.length) {
+      const bodyText = await page.textContent("body").catch(() => "");
+      if (/sign\s*in|log\s*in/i.test(String(bodyText || ""))) {
+        return {
+          ok: false,
+          source: "session",
+          error: "Trade Ideas login expired. Reconnect.",
+          next_step: "Run node tradeideas-session.js again and save a fresh session."
+        };
+      }
+      return {
+        ok: false,
+        source: "session",
+        error: "Saved Trade Ideas session loaded, but no premium alerts were visible on the configured page.",
+        next_step: "Set TRADE_IDEAS_SESSION_URL to your premium scanner or alert page, then try again."
+      };
+    }
+
+    const alerts = snapshot.alerts.slice(0, limit);
+    return {
+      ok: true,
+      source: "session",
+      alerts,
+      headers: snapshot.headers,
+      updated_at: alerts[0]?.timestamp || new Date().toISOString(),
+      title: snapshot.title || "Trade Ideas Premium Session"
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      source: "session",
+      error: error.message || "Could not read Trade Ideas premium session.",
+      next_step: "Reconnect your Trade Ideas session or switch to alert log mode."
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+async function extractTradeIdeasSessionSnapshot(page) {
+  return page.evaluate(() => {
+    const alerts = [];
+    const headers = [];
+    const title = document.title || "Trade Ideas Premium Session";
+    const seen = new Set();
+    const normalize = (text) => String(text || "").replace(/\s+/g, " ").trim();
+    const addAlert = (alert) => {
+      const ticker = String(alert?.ticker || "").trim().toUpperCase();
+      if (!ticker || seen.has(`${alert.strategy}:${ticker}`)) return;
+      seen.add(`${alert.strategy}:${ticker}`);
+      alerts.push({
+        id: `ti_session_${ticker}_${alerts.length + 1}`,
+        ticker,
+        strategy: alert.strategy || "Trade Ideas Premium Session",
+        exchange: alert.exchange || "",
+        price: Number.isFinite(Number(alert.price)) ? Number(alert.price) : null,
+        volume: Number.isFinite(Number(alert.volume)) ? Number(alert.volume) : null,
+        rel_volume: Number.isFinite(Number(alert.rel_volume)) ? Number(alert.rel_volume) : null,
+        note: normalize(alert.note || ""),
+        direction: alert.direction === "short" ? "short" : "long",
+        timestamp: alert.timestamp || new Date().toISOString(),
+        source: "trade_ideas_session",
+        line_number: alerts.length + 1
+      });
+    };
+
+    const parseTimestamp = (raw) => {
+      const text = normalize(raw);
+      if (!text) return new Date().toISOString();
+      const parsed = Date.parse(text);
+      return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString();
+    };
+
+    const extractRaceSymbols = () => {
+      const raceDivs = Array.from(document.querySelectorAll('[id^="race-div-main-"]'));
+      const itemRegex = /([A-Z]{1,5})\s+(\d+(?:\.\d+)?)\s+([▲▼])\s+([+-]?\d+(?:\.\d+)?)\s+\(([+-]?\d+(?:\.\d+)?)%\)/g;
+      for (const div of raceDivs) {
+        const suffix = String(div.id).split("-").pop();
+        const strategy = normalize(document.querySelector(`#stock-race-header-${suffix}`)?.textContent) || "Trade Ideas Premium Race";
+        const text = normalize(div.textContent);
+        let match;
+        let rank = 0;
+        while ((match = itemRegex.exec(text)) !== null) {
+          rank += 1;
+          const [, ticker, price, arrow, changeDollar, changePercent] = match;
+          addAlert({
+            ticker,
+            strategy,
+            price: Number(price),
+            direction: arrow === "▼" ? "short" : "long",
+            note: `${strategy} · ${Number(changePercent) >= 0 ? "+" : ""}${Number(changePercent).toFixed(2)}% · ${Number(changeDollar) >= 0 ? "+" : ""}${Number(changeDollar).toFixed(2)}`,
+            timestamp: new Date().toISOString(),
+            exchange: "",
+            rank
+          });
+        }
+      }
+    };
+
+    const extractCurrentSymbolCard = () => {
+      const headerText = normalize(document.querySelector("#header-main, #main-table-header")?.textContent);
+      const volumeText = normalize(document.querySelector('#wireName\\:Volume')?.textContent);
+      const relVolText = normalize(document.querySelector('#wireName\\:Relative-Volume')?.textContent);
+      const headerMatch = headerText.match(/\(([^:]+):([A-Z]{1,5})\)\s+(\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)\s+\(([+-]?\d+(?:\.\d+)?)%\)\s+(.+)$/);
+      if (!headerMatch) return;
+      const [, exchange, ticker, price, changeDollar, changePercent, timestampRaw] = headerMatch;
+      const volumeMatch = volumeText.match(/Volume\s+([\d,]+)/i);
+      const relVolMatch = relVolText.match(/Relative Volume\s+([\d,.KMB]+)/i);
+      const parseCompact = (value) => {
+        const text = String(value || "").replace(/,/g, "").trim();
+        if (!text) return null;
+        const suffix = text.slice(-1).toUpperCase();
+        const base = Number(["K", "M", "B"].includes(suffix) ? text.slice(0, -1) : text);
+        if (!Number.isFinite(base)) return null;
+        if (suffix === "K") return base * 1_000;
+        if (suffix === "M") return base * 1_000_000;
+        if (suffix === "B") return base * 1_000_000_000;
+        return base;
+      };
+      addAlert({
+        ticker,
+        strategy: "Momentum Waves Selected Symbol",
+        exchange,
+        price: Number(price),
+        volume: volumeMatch ? parseCompact(volumeMatch[1]) : null,
+        rel_volume: relVolMatch ? parseCompact(relVolMatch[1]) : null,
+        direction: Number(changePercent) < 0 ? "short" : "long",
+        note: headerText,
+        timestamp: parseTimestamp(timestampRaw)
+      });
+    };
+
+    headers.push("ticker", "strategy", "price", "timestamp", "direction");
+    extractRaceSymbols();
+    extractCurrentSymbolCard();
+    return { alerts, headers, title };
+  });
+}
+
+async function loadTradeIdeasWebFeed() {
+  try {
+    const [metaResponse, dataResponse] = await Promise.all([
+      fetch(`${TRADE_IDEAS_META_URL}?${TRADE_IDEAS_TOPLIST_CONFIG}`),
+      fetch(`${TRADE_IDEAS_DATA_URL}?${TRADE_IDEAS_TOPLIST_CONFIG}`)
+    ]);
+    if (!metaResponse.ok || !dataResponse.ok) {
+      throw new Error(`Trade Ideas web feed failed (${metaResponse.status}/${dataResponse.status})`);
+    }
+    const meta = await metaResponse.json();
+    const rows = await dataResponse.json();
+    if (!Array.isArray(rows)) {
+      throw new Error("Trade Ideas data feed did not return rows.");
+    }
+    const showDefs = Array.isArray(meta?.show) ? meta.show : [];
+    const alerts = rows.map((row, index) => normalizeTradeIdeasWebAlert(row, showDefs, meta, index)).filter(Boolean);
+    alerts.sort((a, b) => Number(new Date(b.timestamp || 0)) - Number(new Date(a.timestamp || 0)));
+    return {
+      ok: true,
+      alerts,
+      headers: ["symbol", ...showDefs.map((item) => item[0]), "time", "rank", "exchange", "datetime", "epoch"],
+      title: meta?.window_name || "Trade Ideas Top List"
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message || "Trade Ideas web feed unavailable."
+    };
+  }
+}
+
+function parseTradeIdeasCsv(text) {
+  const lines = String(text || "").split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) return { headers: [], alerts: [] };
+  const delimiter = guessDelimitedSeparator(lines[0]);
+  const headers = splitDelimitedLine(lines[0], delimiter).map((header) => normalizeTradeIdeasHeader(header));
+  const alerts = [];
+
+  for (let index = 1; index < lines.length; index += 1) {
+    const parts = splitDelimitedLine(lines[index], delimiter);
+    if (!parts.length) continue;
+    const row = {};
+    headers.forEach((header, headerIndex) => {
+      row[header] = String(parts[headerIndex] || "").trim();
+    });
+    const alert = normalizeTradeIdeasAlert(row, index);
+    if (alert) alerts.push(alert);
+  }
+
+  alerts.sort((a, b) => Number(new Date(b.timestamp || 0)) - Number(new Date(a.timestamp || 0)) || b.line_number - a.line_number);
+  return { headers, alerts };
+}
+
+function guessDelimitedSeparator(line) {
+  const commaCount = (String(line).match(/,/g) || []).length;
+  const tabCount = (String(line).match(/\t/g) || []).length;
+  return tabCount > commaCount ? "\t" : ",";
+}
+
+function splitDelimitedLine(line, delimiter = ",") {
+  const values = [];
+  let current = "";
+  let inQuotes = false;
+  for (let index = 0; index < String(line).length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+    if (char === "\"") {
+      if (inQuotes && next === "\"") {
+        current += "\"";
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if (!inQuotes && char === delimiter) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  values.push(current);
+  return values;
+}
+
+function normalizeTradeIdeasHeader(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function normalizeTradeIdeasAlert(row, lineNumber) {
+  const ticker = normalizeMarketTicker(
+    pickTradeIdeasField(row, ["symbol", "ticker", "stock", "display_symbol", "asset"])
+  );
+  if (!ticker) return null;
+
+  const timeText = pickTradeIdeasField(row, ["time", "timestamp", "date_time", "alert_time", "local_time", "date"]);
+  const strategy = pickTradeIdeasField(row, ["alert_name", "alert", "strategy", "filter", "window", "description"]);
+  const exchange = pickTradeIdeasField(row, ["exchange", "market"]);
+  const price = parseMaybeNumber(pickTradeIdeasField(row, ["price", "last", "last_price", "close", "mark"]));
+  const volume = parseMaybeNumber(pickTradeIdeasField(row, ["volume", "vol", "shares", "share_volume"]));
+  const relVolume = parseMaybeNumber(pickTradeIdeasField(row, ["rel_volume", "relative_volume", "relvol", "volume_ratio"]));
+  const floatValue = parseMaybeNumber(pickTradeIdeasField(row, ["float", "shares_float", "float_mil"]));
+  const note = pickTradeIdeasField(row, ["note", "reason", "comment", "summary"]);
+  const direction = inferTradeIdeasDirection(strategy, note);
+  const timestamp = parseTradeIdeasTimestamp(timeText);
+
+  return {
+    id: `ti_${lineNumber}_${ticker}_${timestamp || timeText || "now"}`,
+    ticker,
+    strategy: strategy || "Trade Ideas alert",
+    exchange: exchange || "",
+    price,
+    volume,
+    rel_volume: relVolume,
+    float: floatValue,
+    note: note || "",
+    direction,
+    timestamp: timestamp || new Date().toISOString(),
+    source: "trade_ideas",
+    line_number: lineNumber
+  };
+}
+
+function normalizeTradeIdeasWebAlert(row, showDefs = [], meta = {}, index = 0) {
+  if (!Array.isArray(row) || !row.length) return null;
+  const ticker = normalizeMarketTicker(row[0]);
+  if (!ticker) return null;
+
+  const values = {};
+  showDefs.forEach((item, itemIndex) => {
+    const code = String(item?.[0] || `field_${itemIndex}`).toUpperCase();
+    values[code] = row[itemIndex + 1];
+  });
+
+  const rankIndex = showDefs.length + 2;
+  const exchangeIndex = showDefs.length + 3;
+  const datetimeIndex = showDefs.length + 4;
+  const epochIndex = showDefs.length + 5;
+  const strategy = meta?.window_name || "Trade Ideas Top List";
+  const changePercent = parseMaybeNumber(values.FCP);
+  const changeDollar = parseMaybeNumber(values.FCD);
+  const price = parseMaybeNumber(values.PRICE);
+  const volume = parseMaybeNumber(values.TV || values.VOL || values.VOLUME);
+  const relVolume = parseMaybeNumber(values.RV || values.RELVOL || values.RELATIVE_VOLUME);
+  const rangePosition = parseMaybeNumber(values.RD);
+  const timestamp = parseTradeIdeasTimestamp(row[datetimeIndex] || row[epochIndex] || row[showDefs.length + 1]);
+  const direction = Number(changePercent || 0) < 0 ? "short" : "long";
+
+  return {
+    id: `ti_web_${ticker}_${row[epochIndex] || index}`,
+    ticker,
+    strategy,
+    exchange: String(row[exchangeIndex] || ""),
+    price,
+    volume,
+    rel_volume: relVolume,
+    range_position: rangePosition,
+    change_dollar: changeDollar,
+    change_percent: changePercent,
+    note: `${strategy}${Number.isFinite(changePercent) ? ` · ${fmtSignedPercent(changePercent)}%` : ""}`,
+    direction,
+    rank: parseMaybeNumber(row[rankIndex]),
+    timestamp: timestamp || new Date().toISOString(),
+    source: "trade_ideas_webfeed",
+    line_number: index + 1
+  };
+}
+
+async function buildTradeIdeasBrainCandidates(alerts = [], limit = 18, mode = "intraday") {
+  const shortlisted = rankTradeIdeasAlerts(alerts).slice(0, limit);
+  if (!shortlisted.length) return [];
+
+  const symbols = shortlisted.map((alert) => alert.ticker);
+  const quotes = await fetchFinnhubQuotesBatched(symbols);
+  const quoteBySymbol = new Map(quotes.filter((quote) => quote?.ok).map((quote) => [quote.symbol, quote]));
+
+  return shortlisted
+    .map((alert, index) => {
+      const quote = quoteBySymbol.get(alert.ticker);
+      const changePercent = Number.isFinite(Number(quote?.changePercent)) ? Number(quote.changePercent) : Number(alert.change_percent || 0);
+      const current = Number.isFinite(Number(quote?.current)) ? Number(quote.current) : Number(alert.price || 0);
+      if (!Number.isFinite(current) || current <= 0) return null;
+
+      const derivedOpen = Number.isFinite(changePercent) && Math.abs(changePercent) < 95
+        ? current / (1 + changePercent / 100)
+        : current;
+      const open = Number.isFinite(Number(quote?.open)) && quote.open > 0 ? Number(quote.open) : derivedOpen;
+      const rangePosition = normalizeTradeIdeasRangePosition(alert.range_position);
+      const syntheticHigh = current * (1 + Math.max(0.003, (1 - (rangePosition ?? 0.5)) * 0.012));
+      const syntheticLow = current * (1 - Math.max(0.003, (rangePosition ?? 0.5) * 0.012));
+      const high = Number.isFinite(Number(quote?.high)) && quote.high > 0 ? Number(quote.high) : syntheticHigh;
+      const low = Number.isFinite(Number(quote?.low)) && quote.low > 0 ? Number(quote.low) : syntheticLow;
+      const enrichedQuote = quote?.ok
+        ? quote
+        : addSessionPriceFields({
+            ok: true,
+            symbol: alert.ticker,
+            current,
+            change: open ? current - open : 0,
+            changePercent: Number.isFinite(changePercent) ? Number(changePercent.toFixed(3)) : 0,
+            high,
+            low,
+            open,
+            volume: Number(alert.volume || 0),
+            volumeRatio: Number(alert.rel_volume || 0),
+            previousClose: open,
+            timestamp: alert.timestamp || new Date().toISOString(),
+            assetClass: mode === "futures" ? "futures" : "equity"
+          });
+      const relVolume = Number(alert.rel_volume || quote?.volumeRatio || 0);
+
+      return {
+        ...enrichedQuote,
+        symbol: alert.ticker,
+        displayName: `${alert.ticker} · ${alert.strategy || "Trade Ideas"}`,
+        current,
+        changePercent: Number.isFinite(changePercent) ? Number(changePercent.toFixed(3)) : 0,
+        score: getTradeIdeasAlertScore(alert, quote, index),
+        rangePosition,
+        volume: Number(quote?.volume || alert.volume || 0),
+        volumeRatio: Number.isFinite(relVolume) ? Number(relVolume.toFixed(2)) : 0,
+        rel_volume: Number.isFinite(relVolume) ? Number(relVolume.toFixed(2)) : null,
+        source: "trade_ideas_brain",
+        signal_mode: mode,
+        asset_class: mode === "futures" ? "futures" : "equity",
+        trade_ideas: {
+          strategy: alert.strategy || "Trade Ideas",
+          rank: alert.rank ?? index + 1,
+          note: alert.note || "",
+          direction: alert.direction || "long",
+          rel_volume: alert.rel_volume ?? null,
+          range_position: rangePosition,
+          change_percent: alert.change_percent ?? null,
+          timestamp: alert.timestamp || null
+        }
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+}
+
+function rankTradeIdeasAlerts(alerts = []) {
+  const bestByTicker = new Map();
+
+  for (const alert of alerts) {
+    const ticker = normalizeMarketTicker(alert?.ticker);
+    if (!ticker) continue;
+    const current = bestByTicker.get(ticker);
+    const score = getTradeIdeasAlertScore(alert, null, 0);
+    if (!current || score > current.__rankScore) {
+      bestByTicker.set(ticker, { ...alert, ticker, __rankScore: score });
+    }
+  }
+
+  return [...bestByTicker.values()].sort((a, b) => Number(b.__rankScore || 0) - Number(a.__rankScore || 0));
+}
+
+function getTradeIdeasAlertScore(alert = {}, quote = null, index = 0) {
+  const changePercent = Number(quote?.changePercent ?? alert.change_percent ?? 0);
+  const relVolume = Number(alert.rel_volume ?? quote?.volumeRatio ?? 0);
+  const volume = Number(alert.volume ?? quote?.volume ?? 0);
+  const rank = Number(alert.rank ?? index + 1);
+  const rankBoost = Number.isFinite(rank) && rank > 0 ? Math.max(0, 18 - rank) : 0;
+
+  return Math.round(
+    rankBoost +
+    Math.max(0, Math.min(30, Math.abs(changePercent) * 6)) +
+    Math.max(0, Math.min(28, relVolume * 8)) +
+    Math.max(0, Math.min(18, volume / 250000))
+  );
+}
+
+function normalizeTradeIdeasRangePosition(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  if (numeric >= 0 && numeric <= 1) return roundNumber(numeric, 3);
+  if (numeric >= 0 && numeric <= 100) return roundNumber(numeric / 100, 3);
+  return null;
+}
+
+function attachTradeIdeasBrainContext(signals = [], candidates = []) {
+  const candidateBySymbol = new Map(candidates.map((candidate) => [candidate.symbol, candidate]));
+  return signals.map((signal) => {
+    const candidate = candidateBySymbol.get(signal.ticker);
+    if (!candidate) return signal;
+    const tradeIdeas = candidate.trade_ideas || null;
+    const executionPlan = signal.execution_plan
+      ? {
+          ...signal.execution_plan,
+          source: "trade_ideas_brain",
+          trade_ideas: tradeIdeas
+        }
+      : signal.execution_plan;
+    return {
+      ...signal,
+      source: "trade_ideas_brain",
+      scanner_source: "trade_ideas",
+      scanner_strategy: tradeIdeas?.strategy || "",
+      scanner_note: tradeIdeas?.note || "",
+      trade_ideas: tradeIdeas,
+      execution_plan: executionPlan
+    };
+  });
+}
+
+function dedupeTradeIdeasPlans(plans = []) {
+  const bestByTicker = new Map();
+  for (const plan of plans) {
+    const ticker = normalizeMarketTicker(plan?.ticker);
+    if (!ticker) continue;
+    const current = bestByTicker.get(ticker);
+    const planScore = Number(plan.final_quality_score || 0) + Number(plan.momentum_score || 0) / 10;
+    if (!current || planScore > current.__score) {
+      bestByTicker.set(ticker, { ...plan, __score: planScore });
+    }
+  }
+  return [...bestByTicker.values()]
+    .sort((a, b) => Number(b.__score || 0) - Number(a.__score || 0))
+    .map(({ __score, ...plan }) => plan);
+}
+
+function pickTradeIdeasField(row, aliases = []) {
+  for (const alias of aliases) {
+    const value = row[alias];
+    if (value !== undefined && value !== null && String(value).trim()) return String(value).trim();
+  }
+  return "";
+}
+
+function parseMaybeNumber(value) {
+  const text = String(value || "").replace(/[$,%\s,]/g, "");
+  if (!text) return null;
+  const number = Number(text);
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseTradeIdeasTimestamp(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+  const today = new Date().toISOString().slice(0, 10);
+  const withToday = Date.parse(`${today} ${text}`);
+  if (Number.isFinite(withToday)) return new Date(withToday).toISOString();
+  return null;
+}
+
+function fmtSignedPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "0";
+  return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
+}
+
+function inferTradeIdeasDirection(strategy = "", note = "") {
+  const text = `${strategy} ${note}`.toLowerCase();
+  if (/(short|bear|down|fade|sell)/.test(text)) return "short";
+  return "long";
+}
+
+function buildTradeIdeasLeaders(alerts = []) {
+  const counts = new Map();
+  for (const alert of alerts) {
+    const key = alert.ticker;
+    const existing = counts.get(key) || {
+      ticker: key,
+      hits: 0,
+      latest_strategy: alert.strategy,
+      latest_price: alert.price,
+      latest_timestamp: alert.timestamp,
+      direction: alert.direction
+    };
+    existing.hits += 1;
+    if (!existing.latest_timestamp || Number(new Date(alert.timestamp || 0)) >= Number(new Date(existing.latest_timestamp || 0))) {
+      existing.latest_strategy = alert.strategy;
+      existing.latest_price = alert.price;
+      existing.latest_timestamp = alert.timestamp;
+      existing.direction = alert.direction;
+    }
+    counts.set(key, existing);
+  }
+  return [...counts.values()]
+    .sort((a, b) => b.hits - a.hits || Number(new Date(b.latest_timestamp || 0)) - Number(new Date(a.latest_timestamp || 0)))
+    .slice(0, 12);
 }
 
 async function updateSignalLifecycles(signals) {
@@ -5022,6 +6210,101 @@ function buildChartOverlayLevels(signal, quote) {
     }));
 }
 
+function buildChartSignals(signal, executionPlan, quote) {
+  if (!signal) return [];
+  const currentPrice = Number(quote?.current);
+  const current = Number.isFinite(currentPrice) ? Number(currentPrice.toFixed(6)) : null;
+  const confidence = Number(signal.confidence || executionPlan?.confidence || 0);
+  const quality = Number(signal.final_quality_score || executionPlan?.final_quality_score || 0);
+  const timestamp = Date.now();
+  const entry = parseFirstNumber(signal.entry || executionPlan?.entry || signal.buy_trigger);
+  const stop = parseFirstNumber(signal.stop || executionPlan?.stop || signal.sell_trigger);
+  const target1 = parseFirstNumber(signal.target1 || executionPlan?.target1);
+  const target2 = parseFirstNumber(signal.target2 || executionPlan?.target2);
+  const finalDecision = String(signal.final_decision || executionPlan?.final_decision || "watch").toLowerCase();
+  const buyNowType = String(executionPlan?.buy_now_type || signal.buy_now_type || signal.signal_type || "").toLowerCase();
+  const bias = String(signal.bias || executionPlan?.bias || "").toLowerCase();
+  const bearish = ["bearish", "short", "sell"].includes(bias);
+  const hasActionableLane = finalDecision === "take" || ["take", "momentum_take", "intertrade_take"].includes(buyNowType);
+  const signals = [];
+
+  const pushSignal = (item) => {
+    if (!Number.isFinite(item.price)) return;
+    signals.push({
+      ticker: signal.ticker,
+      mode: signal.signal_mode || signal.mode || executionPlan?.mode,
+      type: item.type,
+      key: item.key,
+      tone: item.tone,
+      label: item.label,
+      price: Number(item.price.toFixed(6)),
+      reason: item.reason,
+      confidence,
+      timestamp
+    });
+  };
+
+  if (hasActionableLane && !signal.expired_flag) {
+    pushSignal({
+      type: bearish ? "SELL" : "BUY",
+      key: bearish ? "sell_entry" : "buy_entry",
+      tone: bearish ? "sell" : "buy",
+      label: bearish ? "SELL SHORT" : "BUY",
+      price: entry,
+      reason: `${bearish ? "Near short entry" : "Near entry"}, ${signal.momentum_reason || `quality ${quality}`}`
+    });
+    pushSignal({
+      type: "SELL",
+      key: "sell_target1",
+      tone: "sell",
+      label: bearish ? "COVER T1" : "SELL T1",
+      price: target1,
+      reason: bearish ? "First cover / profit zone" : "Target 1 / take profit zone"
+    });
+    pushSignal({
+      type: "SELL",
+      key: "sell_target2",
+      tone: "sell2",
+      label: bearish ? "COVER T2" : "SELL T2",
+      price: target2,
+      reason: bearish ? "Second cover / profit zone" : "Target 2 / stretch target"
+    });
+    pushSignal({
+      type: "STOP",
+      key: "stop",
+      tone: "stop",
+      label: "STOP",
+      price: stop,
+      reason: bearish ? "Stop out if short setup fails" : "Stop loss if setup fails"
+    });
+    return signals;
+  }
+
+  if (finalDecision === "watch" && !signal.expired_flag) {
+    pushSignal({
+      type: "WAIT",
+      key: "wait",
+      tone: "wait",
+      label: "WAIT",
+      price: entry,
+      reason: signal.momentum_reason || "Watch the trigger before entering."
+    });
+    if (Number.isFinite(entry)) {
+      pushSignal({
+        type: "WAIT",
+        key: "breakout",
+        tone: "breakout",
+        label: "BREAKOUT",
+        price: entry,
+        reason: signal.buy_trigger || "Needs confirmation above the trigger."
+      });
+    }
+    return signals;
+  }
+
+  return [];
+}
+
 function getChartOverlayRange(quote, levels = []) {
   const values = [
     Number(quote?.low),
@@ -5750,7 +7033,9 @@ function renderTradingPlatform() {
         <button data-view="movers">Movers</button>
         <button data-view="watchlist">Watchlist</button>
         <button data-view="browser">Market Browser</button>
+        <button data-view="tradeideas">Trade Ideas</button>
         <button data-view="execution">Execution</button>
+        <button data-route="/telescope">Telescope</button>
         <button data-view="alerts">Alerts</button>
         <button data-view="journal">Journal</button>
         <button data-view="settings">Settings</button>
@@ -5800,11 +7085,24 @@ function renderTradingPlatform() {
           <button type="button" data-chart-interval="15" class="active">15m</button>
           <button type="button" data-chart-interval="60">1h</button>
           <button type="button" data-chart-interval="D">1D</button>
+          <button id="chart-signal-toggle" type="button" aria-pressed="true">Show Signals ON</button>
           <button id="chart-close" type="button">Close</button>
         </div>
       </div>
       <div id="chart-frame" class="chart-frame"></div>
       <p class="chart-note">Chart data is provided by TradingView. Use the signal plan first, then verify price action before opening Webull.</p>
+    </div>
+  </div>
+  <div id="framework-modal" class="framework-modal hidden" role="dialog" aria-modal="true" aria-label="Framework details">
+    <div class="framework-modal-shell">
+      <div class="framework-modal-header">
+        <div>
+          <p class="eyebrow">Decision Detail</p>
+          <h3 id="framework-modal-title">Details</h3>
+        </div>
+        <button id="framework-modal-close" type="button">Close</button>
+      </div>
+      <div id="framework-modal-content" class="framework-modal-content"></div>
     </div>
   </div>
     <script src="/public/dashboard.js" type="module"></script>
